@@ -230,3 +230,98 @@ test('RangeReader enforces maxBytes', async () => {
   await rr.read(0, 3000);
   await assert.rejects(rr.read(5000, 10));
 });
+
+// --- 動画の機種名（F2） -------------------------------------------------------
+test('mp4: Android mdta keys com.android.manufacturer / com.android.model', async () => {
+  const t = Date.UTC(2025, 6, 14, 6, 30) / 1000;
+  const meta = appleMeta([
+    ['com.android.version', '14'],
+    ['com.android.manufacturer', 'Google'],
+    ['com.android.model', 'Pixel 8'],
+  ]);
+  const file = cat(box('ftyp', enc.encode('isom'), u32(0)), box('moov', mvhd(t), meta), box('mdat', new Uint8Array(10)));
+  const r = await readMp4CreationTime(new BufferReader(file));
+  assert.equal(r.source, 'mp4-mvhd');
+  assert.equal(r.make, 'Google');
+  assert.equal(r.model, 'Pixel 8');
+  const info = await extractCaptureInfo(new BufferReader(file), 'video/mp4');
+  assert.deepEqual([info.make, info.model, info.offsetMinutes], ['Google', 'Pixel 8', null]);
+});
+
+test('mp4: Canon udta CNMN and uuid CMT1 give the model', async () => {
+  const t = Date.UTC(2025, 6, 13, 13, 20) / 1000;
+  // MOV: moov/udta/CNMN（文字列そのもの）
+  const udta = box('udta', box('CNCV', enc.encode('CanonAVC0010/02.00.00/00.00.00')), box('CNMN', enc.encode('Canon EOS R6\0\0\0\0')));
+  const mov = cat(box('ftyp', enc.encode('qt  '), u32(0)), box('moov', mvhd(t), udta));
+  const r1 = await readMp4CreationTime(new BufferReader(mov));
+  assert.equal(r1.model, 'Canon EOS R6');
+  assert.equal(r1.make, undefined);
+  // MP4: moov/uuid(85c0b687-…)/CMT1 = TIFF IFD0
+  const uuid = Uint8Array.from('85c0b687820f11e08111f4ce462b6a48'.match(/../g), (h) => parseInt(h, 16));
+  const cmt1 = box('CMT1', tiffTags({ ifd0: [[0x010f, 'Canon'], [0x0110, 'Canon EOS R5']] }));
+  const mp4 = cat(box('ftyp', enc.encode('isom'), u32(0)), box('moov', mvhd(t), box('uuid', uuid, box('CNCV', enc.encode('x')), cmt1, box('THMB', new Uint8Array(50)))));
+  const r2 = await readMp4CreationTime(new BufferReader(mp4));
+  assert.equal(r2.make, 'Canon');
+  assert.equal(r2.model, 'Canon EOS R5');
+  // 別の uuid は読まない
+  const other = cat(box('ftyp', enc.encode('isom'), u32(0)), box('moov', mvhd(t), box('uuid', new Uint8Array(16).fill(7), cmt1)));
+  const r3 = await readMp4CreationTime(new BufferReader(other));
+  assert.equal(r3.model, undefined);
+});
+
+// --- EXIF の時差タグ（F3） ----------------------------------------------------
+// 任意のタグを持つ TIFF（ビッグエンディアン、ASCII のみ）
+function tiffTags({ ifd0 = [], exif = null }) {
+  const entry = (tag, type, count, value) => cat(u16(tag), u16(type), u32(count), u32(value));
+  const ifd0Count = ifd0.length + (exif ? 1 : 0);
+  const ifd0Len = 2 + ifd0Count * 12 + 4;
+  const exifOff = 8 + ifd0Len;
+  const exifLen = exif ? 2 + exif.length * 12 + 4 : 0;
+  let dataOff = exifOff + exifLen;
+  const data = [];
+  const str = (s) => {
+    const b = enc.encode(`${s}\0`);
+    const o = dataOff;
+    dataOff += b.length;
+    data.push(b);
+    return [b.length, o];
+  };
+  const e0 = ifd0.map(([tag, s]) => entry(tag, 2, ...str(s)));
+  if (exif) e0.push(entry(0x8769, 4, 1, exifOff));
+  const e1 = exif ? exif.map(([tag, s]) => entry(tag, 2, ...str(s))) : [];
+  return cat(
+    enc.encode('MM'),
+    u16(42),
+    u32(8),
+    u16(ifd0Count),
+    ...e0,
+    u32(0),
+    ...(exif ? [u16(exif.length), ...e1, u32(0)] : []),
+    ...data,
+  );
+}
+
+test('exifToCapture: OffsetTime is used for DateTimeOriginal only when DateTime is the same time', () => {
+  const cap = (ifd0, exif) => exifToCapture(parseTiffExif(tiffTags({ ifd0, exif })));
+  // 編集されたファイル: DateTime（日本で編集）と OffsetTime +09:00 は撮影日時のものではない → 時差不明
+  const edited = cap([[0x0132, '2025:08:01 10:00:00']], [[0x9003, '2025:07:13 21:10:00'], [0x9010, '+09:00']]);
+  assert.equal(edited.tag, 'original');
+  assert.equal(edited.offsetMinutes, null);
+  // 未編集（DateTime = DateTimeOriginal）なら OffsetTime を使う
+  const unedited = cap([[0x0132, '2025:07:13 21:10:00']], [[0x9003, '2025:07:13 21:10:00'], [0x9010, '+03:00']]);
+  assert.equal(unedited.offsetMinutes, 180);
+  // OffsetTimeOriginal は常に優先
+  const both = cap([[0x0132, '2025:08:01 10:00:00']], [[0x9003, '2025:07:13 21:10:00'], [0x9010, '+09:00'], [0x9011, '+03:00']]);
+  assert.equal(both.offsetMinutes, 180);
+  // DateTimeDigitized には OffsetTimeDigitized（0x9012）
+  const digitized = cap([[0x0132, '2025:08:01 10:00:00']], [[0x9004, '2025:07:13 21:10:00'], [0x9010, '+09:00'], [0x9012, '+03:00']]);
+  assert.equal(digitized.tag, 'digitized');
+  assert.equal(digitized.offsetMinutes, 180);
+  assert.equal(parseTiffExif(tiffTags({ exif: [[0x9012, '-05:00']] })).offsetTimeDigitized, '-05:00');
+  const digitizedEdited = cap([[0x0132, '2025:08:01 10:00:00']], [[0x9004, '2025:07:13 21:10:00'], [0x9010, '+09:00']]);
+  assert.equal(digitizedEdited.offsetMinutes, null);
+  // DateTime だけなら OffsetTime がその時差
+  const dtOnly = cap([[0x0132, '2025:08:01 10:00:00']], [[0x9010, '+09:00']]);
+  assert.equal(dtOnly.tag, 'datetime');
+  assert.equal(dtOnly.offsetMinutes, 540);
+});

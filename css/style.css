@@ -457,14 +457,28 @@ input::placeholder {
 /* ------------------------------------------------------------------ */
 /* プレイヤー */
 
+/* スライドショー中は、縦のスワイプで「引っ張って更新」（Android Chrome）が起きて再読み込みされないようにする */
+body[data-screen='player'] {
+  overscroll-behavior: none;
+}
+html:has(> body[data-screen='player']) {
+  overscroll-behavior: none;
+}
+
 .player {
+  /* 操作パネル（.hud）の高さ: 上の余白 40px + 進捗バー 11px + ボタン 52px + 下の余白 */
+  --hud-h: calc(103px + max(10px, env(safe-area-inset-bottom)));
   position: fixed;
   inset: 0;
   background: #000;
   overflow: hidden;
+  overscroll-behavior: none;
   user-select: none;
   -webkit-user-select: none;
   touch-action: pan-y;
+}
+.player:focus {
+  outline: none;
 }
 .player.hud-hidden {
   cursor: none;
@@ -575,6 +589,8 @@ input::placeholder {
 
 .slide-video-embed {
   display: flex;
+  /* 埋め込みプレーヤーの上ではマウスの動きが届かないので、操作パネルを常に表示し、その上までにする */
+  bottom: var(--hud-h);
 }
 .drive-embed {
   flex: 1;
@@ -837,6 +853,10 @@ input::placeholder {
   backdrop-filter: blur(8px);
   overflow: auto;
   overscroll-behavior: contain;
+}
+/* 一覧はダイアログ自体にフォーカスを移すことがある（枠は出さない） */
+.grid-overlay:focus {
+  outline: none;
 }
 .overlay-header {
   position: sticky;

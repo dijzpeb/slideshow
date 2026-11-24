@@ -120,6 +120,9 @@ export function normalizeMimeType(mimeType, name = '') {
   return map[ext] || mt;
 }
 
+/** 403 のうち、待てば通るもの（レート制限など） */
+const RATE_LIMIT_RE = /rateLimitExceeded|userRateLimitExceeded|backendError/i;
+
 function sleep(ms, signal) {
   return new Promise((resolve, reject) => {
     const t = setTimeout(resolve, ms);
@@ -202,9 +205,9 @@ export class DriveClient {
   }
 
   /**
-   * 共通の fetch。401 は一度だけトークンを確認して再試行、429/5xx/レート制限は指数バックオフで再試行。
+   * 共通の fetch。401 は一度だけトークンを確認して再試行、429/5xx/レート制限は指数バックオフで再試行（最大 retries 回）。
    */
-  async _fetch(url, { ids = [], headers = {}, signal, method = 'GET' } = {}) {
+  async _fetch(url, { ids = [], headers = {}, signal, method = 'GET', retries = 4 } = {}) {
     let authRetried = false;
     for (let attempt = 0; ; attempt++) {
       const { headers: h, token } = await this._headers(ids, headers);
@@ -213,7 +216,7 @@ export class DriveClient {
         res = await fetch(url, { method, headers: h, signal, credentials: 'omit', mode: 'cors' });
       } catch (e) {
         if (signal?.aborted) throw e;
-        if (attempt < 3) {
+        if (attempt < Math.min(3, retries)) {
           await sleep(500 * 2 ** attempt, signal);
           continue;
         }
@@ -230,11 +233,8 @@ export class DriveClient {
         continue;
       }
       const err = await toDriveError(res, this.mode);
-      const retryable =
-        res.status === 429 ||
-        res.status >= 500 ||
-        (res.status === 403 && /rateLimitExceeded|userRateLimitExceeded|backendError/i.test(err.reason));
-      if (retryable && attempt < 4) {
+      const retryable = res.status === 429 || res.status >= 500 || (res.status === 403 && RATE_LIMIT_RE.test(err.reason));
+      if (retryable && attempt < retries) {
         await sleep(Math.min(8000, 600 * 2 ** attempt) + Math.floor(Math.random() * 300), signal);
         continue;
       }
@@ -291,29 +291,38 @@ export class DriveClient {
     return all;
   }
 
-  /** 名前でフォルダを検索（OAuth モード用） */
-  async searchFolders(text, { signal } = {}) {
+  /** 名前でフォルダを検索（OAuth モード用）。次のページも読む（最大 maxPages ページ・maxResults 件） */
+  async searchFolders(text, { signal, maxPages = 5, maxResults = 200 } = {}) {
     const clauses = [`mimeType = '${FOLDER_MIME}'`, 'trashed = false'];
     if (text && text.trim()) clauses.push(`name contains '${escapeQueryValue(text.trim())}'`);
-    const data = await this._json(
-      '/drive/v3/files',
-      {
-        q: clauses.join(' and '),
-        fields: 'files(id,name,modifiedTime,resourceKey,parents)',
-        pageSize: 50,
-        orderBy: 'modifiedTime desc',
-        supportsAllDrives: 'true',
-        includeItemsFromAllDrives: 'true',
-      },
-      { signal },
-    );
-    return Array.isArray(data.files) ? data.files : [];
+    const all = [];
+    let pageToken;
+    for (let page = 0; page < maxPages && all.length < maxResults; page++) {
+      const data = await this._json(
+        '/drive/v3/files',
+        {
+          q: clauses.join(' and '),
+          fields: 'nextPageToken,files(id,name,modifiedTime,resourceKey,parents)',
+          pageSize: Math.min(100, maxResults - all.length),
+          pageToken,
+          orderBy: 'modifiedTime desc',
+          supportsAllDrives: 'true',
+          includeItemsFromAllDrives: 'true',
+        },
+        { signal },
+      );
+      if (Array.isArray(data.files)) all.push(...data.files);
+      pageToken = data.nextPageToken;
+      if (!pageToken) break;
+    }
+    return all.slice(0, maxResults);
   }
 
   /**
    * フォルダ配下の画像・動画を（必要ならサブフォルダも）列挙する。
    * ショートカットはリンク先を解決する。同じファイルは一度だけ返す。
-   * @returns {Promise<{root:object, files:object[], folderCount:number, skipped:number}>}
+   * 読めないサブフォルダ（ショートカット先の削除・権限なし）は飛ばして skippedFolders に数える。
+   * @returns {Promise<{root:object, files:object[], folderCount:number, skipped:number, skippedFolders:number}>}
    */
   async listMediaTree(rootId, { recursive = true, signal, onProgress } = {}) {
     let root = await this.getFile(rootId, 'id,name,mimeType,resourceKey,shortcutDetails(targetId,targetMimeType,targetResourceKey)', { signal });
@@ -335,12 +344,20 @@ export class DriveClient {
     let queue = [{ id: root.id, path: [] }];
     let folderCount = 1;
     let skipped = 0;
+    let skippedFolders = 0;
 
     while (queue.length) {
       const batch = queue;
       queue = [];
       await mapLimit(batch, 3, async (folder) => {
-        const children = await this.listChildren(folder.id, { signal });
+        let children;
+        try {
+          children = await this.listChildren(folder.id, { signal });
+        } catch (e) {
+          if (folder.id === root.id || !isSkippableFolderError(e, signal)) throw e;
+          skippedFolders++; // 権限のない・削除されたフォルダ（主にショートカット先）は飛ばす
+          return;
+        }
         for (const f of children) {
           if (f.trashed) continue;
           if (f.mimeType === FOLDER_MIME) {
@@ -389,7 +406,7 @@ export class DriveClient {
       }
     });
     onProgress?.({ folders: folderCount, files: media.size });
-    return { root, files: [...media.values()], folderCount, skipped };
+    return { root, files: [...media.values()], folderCount, skipped, skippedFolders };
   }
 
   /** alt=media の URL（API キーで直接アクセスできる場合のみ意味がある） */
@@ -397,11 +414,11 @@ export class DriveClient {
     return this._url(`/drive/v3/files/${encodeURIComponent(id)}`, { alt: 'media', supportsAllDrives: 'true' });
   }
 
-  /** ファイル本体を取得（Response を返す） */
-  async fetchMedia(id, { signal, range } = {}) {
+  /** ファイル本体を取得（Response を返す）。retries: 一時的なエラーの再試行回数 */
+  async fetchMedia(id, { signal, range, retries } = {}) {
     const headers = {};
     if (range) headers.Range = range;
-    return this._fetch(this.mediaUrl(id), { ids: [id], headers, signal });
+    return this._fetch(this.mediaUrl(id), { ids: [id], headers, signal, retries });
   }
 
   /** バイト範囲 [start, end] を取得 */
@@ -424,6 +441,13 @@ export class DriveClient {
     }
     return c;
   }
+}
+
+/** サブフォルダの一覧取得の失敗のうち、そのフォルダだけ飛ばしてよいもの（404 / 権限なしの 403） */
+function isSkippableFolderError(e, signal) {
+  if (signal?.aborted || e instanceof AuthRequiredError || e?.name === 'AbortError') return false;
+  if (!(e instanceof DriveError)) return false;
+  return e.status === 404 || (e.status === 403 && !RATE_LIMIT_RE.test(e.reason));
 }
 
 /** Drive API のエラーレスポンスを DriveError に変換し、日本語のメッセージを付ける */

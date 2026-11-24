@@ -171,10 +171,10 @@ test('2c. Content-Range hidden by CORS (no Access-Control-Expose-Headers): the S
 
 // Browsers without a usable Service Worker API (e.g. some in-app web views / private modes).
 // Playwright's serviceWorkers:'block' alone makes register() resolve without ever activating a worker,
-// which is test 10 below; here the API is removed entirely so the fallback paths can be exercised.
+// (the app gives up after a timeout, test 10 below); here the API is removed entirely so the fallback paths can be exercised.
 const NO_SW_API = () => { try { delete Navigator.prototype.serviceWorker; } catch { /* ignore */ } };
 
-test('10. [APP BUG] Service Workers blocked by the browser (newContext serviceWorkers:"block"): API-key slideshow must still start and play', { timeout: 120000 }, (t) => suite.wrap('10-sw-blocked', async () => {
+test('10. Service Workers blocked by the browser (newContext serviceWorkers:"block"): API-key slideshow must still start and play', { timeout: 120000 }, (t) => suite.wrap('10-sw-blocked', async () => {
   await suite.admin.reset();
   const app = await suite.newApp({ params: ROOT_PARAMS, contextOptions: { serviceWorkers: 'block' } });
   try {
@@ -182,7 +182,7 @@ test('10. [APP BUG] Service Workers blocked by the browser (newContext serviceWo
   } catch {
     const st = await app.page.evaluate(() => ({ screen: window.__slideshow.screen, loading: document.querySelector('#loading-title').textContent, sw: window.__slideshow.sw }));
     assert.fail(`slideshow never started with Service Workers blocked: stuck on screen=${st.screen} 「${st.loading}」 `
-      + '(js/loader.js setupServiceWorker() awaits navigator.serviceWorker.ready with no timeout; start() awaits it)');
+      + '(setupServiceWorker() must give up on register()/ready after its timeout and return null)');
   }
   await app.waitForSlide({ id: 'img_senate_square' }, 20000);
   await app.jumpViaGrid('vid_tram');

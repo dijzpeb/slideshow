@@ -3,6 +3,10 @@
 export const GIS_SRC = 'https://accounts.google.com/gsi/client';
 export const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
 const TOKEN_KEY = 'finland-slideshow.token.v1';
+/** 期限のこれだけ前からトークンは無効扱い（signedIn と accessToken で同じ基準） */
+const TOKEN_MARGIN_MS = 60000;
+/** ログインのポップアップが応答しないときに諦めるまでの時間 */
+export const REQUEST_TIMEOUT_MS = 120000;
 
 let gisPromise = null;
 
@@ -51,6 +55,7 @@ export class OAuthSession extends EventTarget {
     this.client = null;
     this.pending = null;
     this.timers = [];
+    this.disposed = false;
     this.tokenData = this._restore();
     this._schedule();
   }
@@ -60,7 +65,7 @@ export class OAuthSession extends EventTarget {
       const raw = sessionStorage.getItem(TOKEN_KEY);
       if (!raw) return null;
       const t = JSON.parse(raw);
-      if (t && t.clientId === this.clientId && t.accessToken && t.expiresAt > Date.now() + 60000) return t;
+      if (t && t.clientId === this.clientId && t.accessToken && t.expiresAt > Date.now() + TOKEN_MARGIN_MS) return t;
     } catch {
       /* ignore */
     }
@@ -79,7 +84,7 @@ export class OAuthSession extends EventTarget {
   _schedule() {
     for (const t of this.timers) clearTimeout(t);
     this.timers = [];
-    if (!this.tokenData) return;
+    if (!this.tokenData || this.disposed) return;
     const now = Date.now();
     const exp = this.tokenData.expiresAt;
     const warnAt = exp - 5 * 60000;
@@ -89,8 +94,14 @@ export class OAuthSession extends EventTarget {
     this.timers.push(setTimeout(() => this.dispatchEvent(new Event('expired')), clamp(exp - now)));
   }
 
+  /** 使えるトークンがある（accessToken と同じ基準） */
   get signedIn() {
-    return !!this.tokenData && this.tokenData.expiresAt > Date.now() + 30000;
+    return !!this.accessToken;
+  }
+
+  /** トークンがあと ms ミリ秒以上有効か */
+  isValidFor(ms) {
+    return !!this.tokenData && this.tokenData.expiresAt > Date.now() + Math.max(ms, TOKEN_MARGIN_MS);
   }
 
   get expiresAt() {
@@ -99,7 +110,7 @@ export class OAuthSession extends EventTarget {
 
   /** 有効なトークン（なければ null）。期限 1 分前からは無効扱い */
   get accessToken() {
-    return this.tokenData && this.tokenData.expiresAt > Date.now() + 60000 ? this.tokenData.accessToken : null;
+    return this.tokenData && this.tokenData.expiresAt > Date.now() + TOKEN_MARGIN_MS ? this.tokenData.accessToken : null;
   }
 
   async init() {
@@ -117,19 +128,35 @@ export class OAuthSession extends EventTarget {
   /**
    * トークンを要求する（ポップアップが開くため、クリックなどのユーザー操作の中で呼ぶこと）。
    * 一度許可済みなら、ポップアップはすぐに閉じる。
+   * 前の要求が終わっていなければ（ポップアップが裏に隠れた等）もう一度開いて、同じ promise を返す。
+   * 応答がないまま REQUEST_TIMEOUT_MS たつと AuthError で失敗する。
    */
   request({ prompt = '' } = {}) {
-    if (this.pending) return this.pending.promise;
+    if (this.disposed) return Promise.reject(new AuthError('ログインが中止されました。', 'disposed'));
     if (!this.client) return Promise.reject(new AuthError('ログイン機能がまだ準備できていません。', 'not_ready'));
+    const p = this.pending;
+    if (p) {
+      try {
+        // GIS がポップアップを前面に出す（または開き直す）
+        this.client.requestAccessToken({ prompt });
+        p.outstanding++;
+        this._armTimeout(p);
+      } catch {
+        /* 前の要求の結果を待つ */
+      }
+      return p.promise;
+    }
     let resolve;
     let reject;
     const promise = new Promise((res, rej) => {
       resolve = res;
       reject = rej;
     });
-    this.pending = { promise, resolve, reject };
+    const entry = { promise, resolve, reject, outstanding: 1, timer: null };
+    this.pending = entry;
     try {
       this.client.requestAccessToken({ prompt });
+      this._armTimeout(entry);
     } catch (e) {
       this.pending = null;
       reject(new AuthError(`ログインを開始できませんでした: ${e && e.message}`));
@@ -137,10 +164,19 @@ export class OAuthSession extends EventTarget {
     return promise;
   }
 
+  _armTimeout(entry) {
+    clearTimeout(entry.timer);
+    entry.timer = setTimeout(() => {
+      if (this.pending !== entry) return;
+      this._settle(false, new AuthError('ログイン画面から応答がありませんでした。もう一度お試しください。', 'timeout'));
+    }, REQUEST_TIMEOUT_MS);
+  }
+
   _settle(ok, value) {
     const p = this.pending;
     this.pending = null;
     if (!p) return;
+    clearTimeout(p.timer);
     if (ok) p.resolve(value);
     else p.reject(value);
   }
@@ -179,6 +215,12 @@ export class OAuthSession extends EventTarget {
   }
 
   _onError(err) {
+    const p = this.pending;
+    if (p && p.outstanding > 1) {
+      // 開き直す前のポップアップが閉じられた通知。開き直したほうの結果を待つ
+      p.outstanding--;
+      return;
+    }
     const type = (err && err.type) || 'unknown';
     const msg =
       type === 'popup_failed_to_open'
@@ -204,6 +246,14 @@ export class OAuthSession extends EventTarget {
       return null;
     }
     return this.accessToken;
+  }
+
+  /** このセッションを使わなくなったとき（クライアント ID の変更など）。タイマーを止め、待っている要求を終わらせる */
+  dispose() {
+    this.disposed = true;
+    for (const t of this.timers) clearTimeout(t);
+    this.timers = [];
+    this._settle(false, new AuthError('ログインが中止されました。', 'disposed'));
   }
 
   signOut() {

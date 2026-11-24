@@ -66,7 +66,7 @@ test('4. per-camera time correction in the grid: Canon EOS R6 −6 h → expecte
   assert.match(tileTitle, /補正 -360分/);
   // stored
   const stored = await app.page.evaluate((k) => JSON.parse(localStorage.getItem(k)), SETTINGS_KEY);
-  assert.deepEqual(stored.cameraOffsets, { 'Canon EOS R6': -360 });
+  assert.deepEqual(stored.cameraOffsets, { folder_root: { 'Canon EOS R6': -360 } }, 'corrections are stored per folder');
 
   // close the grid and check the corrected Canon photo is shown at its new position
   await app.page.keyboard.press('Escape');
@@ -136,7 +136,7 @@ test('5. manual refresh (今すぐ更新): newly revealed photos are inserted ch
   await app.close();
 })(t));
 
-test('5c. [APP BUG] when the photo on screen is deleted from Drive and the folder is refreshed, the next item is not skipped', { timeout: 120000 }, (t) => suite.wrap('05c-remove-current', async () => {
+test('5c. when the photo on screen is deleted from Drive and the folder is refreshed, the next item is not skipped', { timeout: 120000 }, (t) => suite.wrap('05c-remove-current', async () => {
   await suite.admin.reset();
   const app = await suite.newApp({ params: ROOT_PARAMS });
   await app.waitForPlayer();
@@ -159,7 +159,7 @@ test('5c. [APP BUG] when the photo on screen is deleted from Drive and the folde
   await app.page.waitForFunction((m) => window.__slideLog.length > m, n, { timeout: 15000 });
   const next = (await app.slideLog())[n];
   assert.equal(next.id, following, `after the removed ${cur.id} the show must continue with ${following}, but showed ${next.id} `
-    + '(js/player.js setItems(): when the current slide key is gone, index keeps pointing at the slide that moved into its place, so next() skips it)');
+    + '(Player.setItems(): when the current slide is gone, next() must show the slide that moved into its place)');
   assertNoPageErrors(app);
   await app.close();
 })(t));

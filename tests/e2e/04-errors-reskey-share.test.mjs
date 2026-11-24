@@ -102,7 +102,7 @@ test('7b. setup form validation (empty / malformed folder URL, missing key / cli
   await app.close();
 })(t));
 
-test('7b2. [APP BUG] an invalid trip time zone typed in the form is rejected with the validation message (not silently replaced)', { timeout: 60000 }, (t) => suite.wrap('07b2-timezone', async () => {
+test('7b2. an invalid trip time zone typed in the form is rejected with the validation message (not silently replaced)', { timeout: 60000 }, (t) => suite.wrap('07b2-timezone', async () => {
   await suite.admin.reset();
   const app = await suite.newApp({ params: {} });
   const { page } = app;
@@ -115,9 +115,31 @@ test('7b2. [APP BUG] an invalid trip time zone typed in the form is rejected wit
   await page.click('#btn-start');
   await page.waitForFunction(() => window.__slideshow.screen === 'player' || !document.querySelector('#setup-error').hidden, null, { timeout: 20000 });
   const st = await page.evaluate(() => ({ screen: window.__slideshow.screen, tz: window.__slideshow.settings.timeZone, err: document.querySelector('#setup-error').textContent }));
-  assert.equal(st.screen, 'setup', `the show started anyway with timeZone=${st.tz} (js/app.js submit handler runs sanitize() before validate(), `
-    + 'so validate()\'s 「タイムゾーン…が正しくありません」 check is unreachable and the typo is silently replaced by Europe/Helsinki)');
+  assert.equal(st.screen, 'setup', `the show started anyway with timeZone=${st.tz} (the form input must be validated before sanitize() replaces it)`);
   assert.equal(st.err, 'タイムゾーン「Asia/Tokio」が正しくありません（例：Europe/Helsinki）。');
+  // the share button does not produce a link without the time zone either
+  await page.evaluate(() => {
+    window.__copied = [];
+    try {
+      navigator.clipboard.writeText = async (x) => { window.__copied.push(x); };
+    } catch { /* ignore */ }
+    window.prompt = (msg, x) => { window.__copied.push(x); return null; };
+    document.querySelector('#setup-error').hidden = true;
+  });
+  await page.click('#btn-share');
+  const share = await page.evaluate(() => ({ copied: window.__copied, err: document.querySelector('#setup-error').hidden ? '' : document.querySelector('#setup-error').textContent }));
+  assert.deepEqual(share, { copied: [], err: 'タイムゾーン「Asia/Tokio」が正しくありません（例：Europe/Helsinki）。' });
+  await page.fill('input[name="timeZone"]', 'Asia/Tokyo');
+  await page.click('#btn-share');
+  const ok = await page.evaluate(() => window.__copied);
+  assert.equal(ok.length, 1);
+  assert.equal(new URL(ok[0]).searchParams.get('tz'), 'Asia/Tokyo');
+  // a tz= typo in a link is shown in the form with the message; autostart does not start the show
+  await app.goto({ folder: 'folder_day4', key: TEST_KEY, mode: 'apikey', tz: 'Asia/Tokio', autostart: 1 });
+  await page.waitForSelector('#setup:not([hidden])');
+  await page.waitForTimeout(1000);
+  const fromUrl = await page.evaluate(() => ({ screen: window.__slideshow.screen, tz: document.querySelector('input[name="timeZone"]').value, err: document.querySelector('#setup-error').textContent }));
+  assert.deepEqual(fromUrl, { screen: 'setup', tz: 'Asia/Tokio', err: 'タイムゾーン「Asia/Tokio」が正しくありません（例：Europe/Helsinki）。' });
   await app.close();
 })(t));
 
@@ -156,19 +178,20 @@ test('7c. a photo that cannot be downloaded (HTTP 500, no thumbnail) is skipped 
   await app.close();
 })(t));
 
-test('7d. a transient download error on a photo falls back to the Drive thumbnail (no gap)', { timeout: 120000 }, (t) => suite.wrap('07d-thumb-fallback', async () => {
+test('7d. a download error that outlasts the retries falls back to the Drive thumbnail (no gap)', { timeout: 120000 }, (t) => suite.wrap('07d-thumb-fallback', async () => {
   await suite.admin.reset();
   const app = await suite.newApp({ params: ROOT_PARAMS });
   await app.waitForPlayer();
   // wait until the background EXIF reads are done, so that the failure hits the photo download
   await app.page.waitForFunction(() => window.__slideshow.items.find((i) => i.id === 'img_lake')?.timeSource === 'exif-offset', null, { timeout: 30000 });
-  await suite.admin.fail('img_lake', 503, 1);
+  // photo downloads retry 429/5xx three times (1 + 3 attempts); a single 503 is covered in 10-fixes
+  await suite.admin.fail('img_lake', 503, 4);
   await app.jumpViaGrid('img_breakfast');
   await app.waitForSlide({ id: 'img_lake' }, 30000);
   await app.page.waitForFunction(() => window.__slideLog.find((e) => e.id === 'img_lake')?.nw > 0);
   const e = (await app.slideLog()).find((x) => x.id === 'img_lake');
   assert.ok(e.src.startsWith(`${suite.env.driveUrl}/thumb/img_lake=s`), `thumbnail used: ${e.src}`);
-  assert.ok(mediaRequests(await suite.admin.log(), 'img_lake').some((x) => x.status === 503));
+  assert.equal(mediaRequests(await suite.admin.log(), 'img_lake').filter((x) => x.status === 503).length, 4, 'retried three times');
   assertNoPageErrors(app);
   await app.close();
 })(t));

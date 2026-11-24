@@ -1,5 +1,6 @@
 // 写真・動画ファイルのバイナリから撮影日時を読み取る（DOM 非依存。Node のテストからも使う）
 //  - MP4 / MOV: mvhd の creation_time、Apple の com.apple.quicktime.creationdate、©day
+//    （機種名: Apple / Android の mdta キー、©mak/©mod、Canon の CNMN・CMT1）
 //  - JPEG: EXIF DateTimeOriginal / OffsetTimeOriginal
 //  - HEIC/HEIF: Exif アイテム
 // ファイル全体はダウンロードせず、RangeReader を通じて必要な部分だけ Range リクエストで読む。
@@ -214,6 +215,13 @@ export async function readMp4CreationTime(reader) {
     } else if (box.type === 'udta' && box.size <= MAX_SMALL_BOX) {
       const b = await reader.read(box.start, box.size);
       parseUdta(b, box.headerSize, b.length, found);
+    } else if (box.type === 'uuid' && box.size <= MAX_SMALL_BOX && !(found.make && found.model)) {
+      // Canon の MP4: moov/uuid の CMT1（IFD0）に Make / Model がある
+      const head = await reader.read(box.start + box.headerSize, 16);
+      if (head.length === 16 && hex(head) === CANON_UUID) {
+        const b = await reader.read(box.start, box.size);
+        parseCanonUuid(b, box.headerSize + 16, b.length, found);
+      }
     }
   }
 
@@ -320,11 +328,14 @@ function assignMeta(name, value, found) {
       found.day = found.day || value;
       break;
     case 'com.apple.quicktime.make':
+    case 'com.android.manufacturer':
     case '©mak':
       found.make = found.make || value;
       break;
     case 'com.apple.quicktime.model':
+    case 'com.android.model':
     case '©mod':
+    case 'CNMN':
       found.model = found.model || value;
       break;
     default:
@@ -350,6 +361,35 @@ function parseUdta(b, start, end, found) {
           assignMeta(type, value, found);
         }
       }
+    } else if (type === 'CNMN') {
+      // Canon の MOV/MP4: 機種名の文字列そのもの
+      assignMeta(type, latin1(b, p + 8, p + size).replace(/\u0000[\s\S]*$/, '').trim(), found);
+    }
+    p += size;
+  }
+}
+
+const CANON_UUID = '85c0b687820f11e08111f4ce462b6a48';
+
+function hex(b) {
+  let s = '';
+  for (let i = 0; i < b.length; i++) s += b[i].toString(16).padStart(2, '0');
+  return s;
+}
+
+// Canon の uuid ボックスの子（CNCV, CMT1, THMB …）から CMT1 = TIFF の IFD0 を読む
+function parseCanonUuid(b, start, end, found) {
+  let p = start;
+  while (p + 8 <= end) {
+    const size = u32be(b, p);
+    if (size < 8 || p + size > end) break;
+    if (fourcc(b, p + 4) === 'CMT1') {
+      const ifd0 = parseTiffExif(b.subarray(p + 8, p + size));
+      if (ifd0) {
+        assignMeta('©mak', ifd0.make, found);
+        assignMeta('©mod', ifd0.model, found);
+      }
+      break;
     }
     p += size;
   }
@@ -369,11 +409,12 @@ const TAG_DATETIME_ORIGINAL = 0x9003;
 const TAG_DATETIME_DIGITIZED = 0x9004;
 const TAG_OFFSET_TIME = 0x9010;
 const TAG_OFFSET_TIME_ORIGINAL = 0x9011;
+const TAG_OFFSET_TIME_DIGITIZED = 0x9012;
 const TAG_SUBSEC_ORIGINAL = 0x9291;
 
 /**
  * TIFF ヘッダから始まるバイト列を解析して日時関連タグを返す。
- * @returns {null|{dateTimeOriginal?:string, dateTimeDigitized?:string, dateTime?:string, offsetTimeOriginal?:string, offsetTime?:string, subSecOriginal?:string, make?:string, model?:string, orientation?:number, thumbnailOffset?:number, thumbnailLength?:number}}
+ * @returns {null|{dateTimeOriginal?:string, dateTimeDigitized?:string, dateTime?:string, offsetTimeOriginal?:string, offsetTimeDigitized?:string, offsetTime?:string, subSecOriginal?:string, make?:string, model?:string, orientation?:number, thumbnailOffset?:number, thumbnailLength?:number}}
  *   thumbnailOffset は TIFF ヘッダ先頭からのオフセット
  */
 export function parseTiffExif(t) {
@@ -437,6 +478,7 @@ export function parseTiffExif(t) {
       if (tag === TAG_DATETIME_ORIGINAL) out.dateTimeOriginal = ascii(type, count, vo) || undefined;
       else if (tag === TAG_DATETIME_DIGITIZED) out.dateTimeDigitized = ascii(type, count, vo) || undefined;
       else if (tag === TAG_OFFSET_TIME_ORIGINAL) out.offsetTimeOriginal = ascii(type, count, vo) || undefined;
+      else if (tag === TAG_OFFSET_TIME_DIGITIZED) out.offsetTimeDigitized = ascii(type, count, vo) || undefined;
       else if (tag === TAG_OFFSET_TIME) out.offsetTime = ascii(type, count, vo) || undefined;
       else if (tag === TAG_SUBSEC_ORIGINAL) out.subSecOriginal = ascii(type, count, vo) || undefined;
     });
@@ -608,8 +650,15 @@ function findItemLocation(b, start, end, itemId) {
   return null;
 }
 
+function sameWall(a, b) {
+  return !!a && !!b && a.y === b.y && a.mo === b.mo && a.d === b.d && a.h === b.h && a.mi === b.mi && a.s === b.s;
+}
+
 /**
  * EXIF の解析結果から撮影日時情報を作る。
+ * オフセットは各日時に対応するタグを使う（DateTimeOriginal → OffsetTimeOriginal、
+ * DateTimeDigitized → OffsetTimeDigitized、DateTime → OffsetTime）。OffsetTime は DateTime（更新日時）の
+ * 時差なので、DateTime と同じ時刻のとき（未編集のファイル）に限って他の日時にも使う。
  * @returns {null|{wall, offsetMinutes:number|null, tag:'original'|'digitized'|'datetime', make?:string, model?:string}}
  */
 export function exifToCapture(exif) {
@@ -629,8 +678,11 @@ export function exifToCapture(exif) {
     const ss = exif.subSecOriginal.replace(/\D/g, '').slice(0, 3);
     if (ss) wall.ms = Number(ss.padEnd(3, '0'));
   }
-  const offStr = tag === 'original' ? exif.offsetTimeOriginal || exif.offsetTime : exif.offsetTime;
-  const offsetMinutes = parseUtcOffset(offStr || '');
+  const own = tag === 'original' ? exif.offsetTimeOriginal : tag === 'digitized' ? exif.offsetTimeDigitized : exif.offsetTime;
+  let offsetMinutes = parseUtcOffset(own || '');
+  if (offsetMinutes == null && tag !== 'datetime' && sameWall(wall, parseExifDateTime(exif.dateTime))) {
+    offsetMinutes = parseUtcOffset(exif.offsetTime || '');
+  }
   return { wall, offsetMinutes, tag, make: exif.make, model: exif.model };
 }
 

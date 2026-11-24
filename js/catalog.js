@@ -1,6 +1,7 @@
 // Drive のファイル情報と解析結果から、撮影日時順のスライド項目を作る（DOM 非依存）
 
 import {
+  tzOffsetMs,
   wallClockToEpoch,
   wallClockWithOffsetToEpoch,
   parseExifDateTime,
@@ -78,14 +79,83 @@ export function cameraLabel(make, model) {
 
 export const UNKNOWN_PHOTO_GROUP = '写真（機種不明）';
 export const UNKNOWN_VIDEO_GROUP = '動画（機種不明）';
+/** 撮影日時が（撮影地のタイムゾーンと違う）UTC オフセット付きで記録されていたファイルのグループ名に付ける接尾辞 */
+export const ZONED_GROUP_SUFFIX = '（タイムゾーン記録あり）';
+/**
+ * 機種名の分かる動画のうち、日時を MP4 の作成日時（mvhd、UTC として読む）から取ったもののグループ名に付ける接尾辞。
+ * 多くのカメラは mvhd に現地時刻を書くため、現地時刻として読む写真とは必要な補正が違う
+ */
+export const MVHD_VIDEO_GROUP_SUFFIX = '（動画）';
 
-/** カメラ別時刻補正のグループ名 */
-export function cameraGroup(file, extracted, kind) {
+// 機種名が読めない動画をファイル名の付け方で分ける
+const VIDEO_NAME_GROUPS = [
+  [/^(?:GOPR\d{4}|G[HXP]\d{6})(?!\d)/i, 'GoPro（ファイル名から推定）'],
+  [/^MVI_\d/i, 'Canon（ファイル名から推定）'],
+  [/^DJI_\d/i, 'DJI（ファイル名から推定）'],
+  [/^(?:PXL|VID|IMG)_/i, 'スマートフォン動画（ファイル名から推定）'],
+];
+
+/** Drive またはファイルのメタデータから読んだ機種名（なければ ''） */
+function deviceLabel(file, extracted) {
   const im = file.imageMediaMetadata || {};
-  let label = cameraLabel(im.cameraMake, im.cameraModel);
-  if (!label && extracted) label = cameraLabel(extracted.make, extracted.model);
+  const label = cameraLabel(im.cameraMake, im.cameraModel);
+  if (label || !extracted) return label;
+  return cameraLabel(extracted.make, extracted.model);
+}
+
+/** カメラ（機種）のグループ名。機種が分からなければファイル名から推定、それも無理なら「機種不明」 */
+export function cameraGroup(file, extracted, kind) {
+  const label = deviceLabel(file, extracted);
   if (label) return label;
-  return kind === 'video' ? UNKNOWN_VIDEO_GROUP : UNKNOWN_PHOTO_GROUP;
+  if (kind === 'video') {
+    const name = typeof file.name === 'string' ? file.name.trim() : '';
+    for (const [re, group] of VIDEO_NAME_GROUPS) if (re.test(name)) return group;
+    return UNKNOWN_VIDEO_GROUP;
+  }
+  return UNKNOWN_PHOTO_GROUP;
+}
+
+/**
+ * resolveCaptureTime の結果が UTC オフセット付きの時刻か（カメラの時計の時差設定に左右されない）。
+ * EXIF の OffsetTime*、Apple の creationdate / ©day の時差、Pixel のファイル名（UTC）が該当。
+ */
+export function hasExplicitOffset(file, extracted, source) {
+  if (source === 'exif-offset') return true;
+  if (source === 'mp4-apple' || source === 'mp4-day') return Number.isFinite(extracted?.offsetMinutes);
+  if (source === 'filename') return !!parseFilenameTime(file.name)?.utc;
+  return false;
+}
+
+/**
+ * 記録されていた UTC オフセットが、その時刻の撮影地（timeZone）のオフセットと同じか。
+ * 同じなら現地時刻として読んでも同じ時刻になる（あとから EXIF を読んでも時刻の基準が変わらない）
+ */
+export function offsetMatchesZone(extracted, epoch, timeZone) {
+  const off = extracted && extracted.offsetMinutes;
+  if (!Number.isFinite(off) || !Number.isFinite(epoch) || !timeZone) return false;
+  try {
+    return Math.round(tzOffsetMs(epoch, timeZone) / 60000) === off;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * カメラ別時刻補正のグループ名。
+ *  - 撮影地と違う UTC オフセット付きの時刻は「<機種>（タイムゾーン記録あり）」にして、現地時刻として読んだ時刻向けの
+ *    補正が（あとから EXIF を読んだときなどに）二重にかからないようにする。オフセットが撮影地と同じなら
+ *    どちらで読んでも同じ時刻なので分けない（時計のずれの補正がそのまま効く）
+ *  - 機種名の分かる動画で mvhd（UTC として読む）の時刻は「<機種>（動画）」にして、写真とは別に補正できるようにする
+ * @param {{epoch?:number, timeZone?:string}} [at]  resolveCaptureTime の時刻と撮影地のタイムゾーン
+ */
+export function correctionGroup(file, extracted, kind, source, { epoch, timeZone } = {}) {
+  const base = cameraGroup(file, extracted, kind);
+  if (hasExplicitOffset(file, extracted, source)) {
+    if (source !== 'filename' && offsetMatchesZone(extracted, epoch, timeZone)) return base;
+    return `${base}${ZONED_GROUP_SUFFIX}`;
+  }
+  if (kind === 'video' && source === 'mp4-mvhd' && deviceLabel(file, extracted)) return `${base}${MVHD_VIDEO_GROUP_SUFFIX}`;
+  return base;
 }
 
 /**
@@ -96,6 +166,8 @@ export function cameraGroup(file, extracted, kind) {
  *  3. 動画: MP4/MOV のメタデータ（Apple creationdate → ©day → mvhd(UTC)）
  *  4. ファイル名の日時（Pixel の PXL_ は UTC、それ以外は現地時刻）
  *  5. ドライブ上の更新日時と作成日時の早い方
+ * 撮影地と違うオフセット付きで解釈した時刻（source 'exif-offset'、時差付きの mp4-apple / mp4-day）と
+ * PXL_ のファイル名（UTC）は、補正グループが別になる（correctionGroup）。
  */
 export function resolveCaptureTime(file, extracted, timeZone) {
   const mt = normalizeMimeType(file.mimeType, file.name);
@@ -109,7 +181,9 @@ export function resolveCaptureTime(file, extracted, timeZone) {
     }
     const w = file.imageMediaMetadata && parseExifDateTime(file.imageMediaMetadata.time);
     if (w) return { epoch: wallClockToEpoch(w, timeZone), source: 'exif' };
-    if (extracted && extracted.wall) return { epoch: fromFile(extracted), source: 'exif' };
+    if (extracted && extracted.wall) {
+      return { epoch: fromFile(extracted), source: extracted.offsetMinutes != null ? 'exif-offset' : 'exif' };
+    }
   } else if (kind === 'video') {
     if (extracted && Number.isFinite(extracted.epoch) && extracted.source) {
       return { epoch: extracted.epoch, source: extracted.source };
@@ -131,10 +205,12 @@ export function resolveCaptureTime(file, extracted, timeZone) {
  * スライド項目を作って撮影日時順に並べる。
  * @param {object[]} files       Drive のファイル情報（folderPath 付き）
  * @param {Map<string,object>|object} extractedById  解析結果
- * @param {{timeZone:string, cameraOffsets?:Record<string,number>}} opts  cameraOffsets は分単位
+ * @param {{timeZone:string, cameraOffsets?:Record<string,number>}} opts
+ *   cameraOffsets は { [補正グループ名]: 分 }（このフォルダ分。settings.offsetsForFolder の戻り値）
  */
-export function buildCatalog(files, extractedById, { timeZone, cameraOffsets = {} } = {}) {
+export function buildCatalog(files, extractedById, { timeZone, cameraOffsets } = {}) {
   const get = (id) => (extractedById instanceof Map ? extractedById.get(id) : extractedById?.[id]) || null;
+  const offsets = cameraOffsets && typeof cameraOffsets === 'object' ? cameraOffsets : {};
   const items = [];
   for (const f of files) {
     const mimeType = normalizeMimeType(f.mimeType, f.name);
@@ -142,8 +218,8 @@ export function buildCatalog(files, extractedById, { timeZone, cameraOffsets = {
     if (!kind) continue;
     const ex = get(f.id);
     const { epoch: rawEpoch, source } = resolveCaptureTime(f, ex, timeZone);
-    const group = cameraGroup(f, ex, kind);
-    const offsetMin = Number(cameraOffsets[group]) || 0;
+    const group = correctionGroup(f, ex, kind, source, { epoch: rawEpoch, timeZone });
+    const offsetMin = (Object.prototype.hasOwnProperty.call(offsets, group) && Math.round(Number(offsets[group]))) || 0;
     const epoch = rawEpoch + offsetMin * 60000;
     const im = f.imageMediaMetadata || {};
     const vm = f.videoMediaMetadata || {};
@@ -198,9 +274,44 @@ export function summarizeGroups(items) {
   return [...m.values()].sort((a, b) => b.count - a.count);
 }
 
+/** これより長く（日数）間が空いた日は別のまとまりとみなす */
+export const OUTLIER_GAP_DAYS = 30;
+
+/**
+ * 旅行の主な期間。撮影日を OUTLIER_GAP_DAYS 日を超える空きで区切ったまとまりのうち、件数が最も多いもの
+ * （同数なら早い方）。時計が未設定のカメラ（2000年1月1日など）や日時推定のファイルが「1日目」を決めないようにする。
+ * @returns {null|{firstDay:string, lastDay:string, count:number}}
+ */
+export function mainDayRange(items) {
+  const counts = new Map();
+  for (const it of items) counts.set(it.day, (counts.get(it.day) || 0) + 1);
+  const days = [...counts.keys()].sort();
+  if (!days.length) return null;
+  let best = null;
+  let cur = null;
+  for (const day of days) {
+    if (cur && daysBetween(cur.lastDay, day) > OUTLIER_GAP_DAYS) {
+      if (!best || cur.count > best.count) best = cur;
+      cur = null;
+    }
+    if (!cur) cur = { firstDay: day, lastDay: day, count: 0 };
+    cur.lastDay = day;
+    cur.count += counts.get(day);
+  }
+  if (!best || cur.count > best.count) best = cur;
+  return best;
+}
+
+/** 主な期間の何日目か（期間外の日は null） */
+function dayNumberIn(range, day) {
+  if (!range || day < range.firstDay || day > range.lastDay) return null;
+  return daysBetween(range.firstDay, day) + 1;
+}
+
 /**
  * スライド列（タイトル・日付カード・写真/動画）を作る。
- * @returns {Array<{key:string,type:'title'|'day'|'media', item?:object, day?:string, dayIndex?:number, dayNumber?:number, count?:number}>}
+ * 日付カードの dayNumber は主な期間（mainDayRange）の初日を 1 とした暦日。期間外の日は null（日付だけ表示する）。
+ * @returns {Array<{key:string,type:'title'|'day'|'media', item?:object, day?:string, dayIndex?:number, dayNumber?:number|null, count?:number}>}
  */
 export function buildSlides(items, { showTitleCard = true, showDayCards = true } = {}) {
   const slides = [];
@@ -210,6 +321,7 @@ export function buildSlides(items, { showTitleCard = true, showDayCards = true }
   for (const it of items) if (days[days.length - 1] !== it.day) days.push(it.day);
   const counts = new Map();
   for (const it of items) counts.set(it.day, (counts.get(it.day) || 0) + 1);
+  const main = mainDayRange(items);
   let lastDay = null;
   for (const it of items) {
     if (showDayCards && it.day !== lastDay) {
@@ -218,7 +330,7 @@ export function buildSlides(items, { showTitleCard = true, showDayCards = true }
         type: 'day',
         day: it.day,
         dayIndex: days.indexOf(it.day),
-        dayNumber: daysBetween(days[0], it.day) + 1,
+        dayNumber: dayNumberIn(main, it.day),
         count: counts.get(it.day),
       });
     }
@@ -228,16 +340,33 @@ export function buildSlides(items, { showTitleCard = true, showDayCards = true }
   return slides;
 }
 
-/** 日付キーの配列から旅行の日数・期間をまとめる */
+function rangeOf(list) {
+  let first = Infinity;
+  let last = -Infinity;
+  const days = new Set();
+  for (const it of list) {
+    if (it.epoch < first) first = it.epoch;
+    if (it.epoch > last) last = it.epoch;
+    days.add(it.day);
+  }
+  const sorted = [...days].sort();
+  return { first, last, firstDay: sorted[0], lastDay: sorted[sorted.length - 1], dayCount: sorted.length };
+}
+
+/**
+ * 旅行の期間・件数をまとめる（タイトルカード用）。
+ * first / last / firstDay / lastDay / dayCount は主な期間（= main）のもの。全件の範囲は all。
+ * outliers は主な期間の外にある件数。
+ */
 export function tripSummary(items) {
   if (!items.length) return null;
-  const days = [...new Set(items.map((i) => i.day))].sort();
+  const range = mainDayRange(items);
+  const main = rangeOf(items.filter((i) => dayNumberIn(range, i.day) != null));
   return {
-    first: items[0].epoch,
-    last: items[items.length - 1].epoch,
-    firstDay: days[0],
-    lastDay: days[days.length - 1],
-    dayCount: days.length,
+    ...main,
+    main,
+    all: rangeOf(items),
+    outliers: items.length - range.count,
     photos: items.filter((i) => i.kind === 'image').length,
     videos: items.filter((i) => i.kind === 'video').length,
   };

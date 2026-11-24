@@ -15,7 +15,6 @@ after(async () => {
 });
 
 const ROOT_PARAMS = { folder: 'folder_root', key: TEST_KEY, mode: 'apikey', interval: 1, autostart: 1 };
-const HEIC_TO_SRC = 'https://cdn.jsdelivr.net/npm/heic-to@1.6.7/dist/heic-to.js';
 
 async function jumpTo(app, id, timeout) {
   await app.page.keyboard.press('g');
@@ -26,47 +25,39 @@ async function jumpTo(app, id, timeout) {
   return (await app.slideLog()).find((e) => e.id === id);
 }
 
-test('11. HEIC photo is converted in the browser (heic-to from jsDelivr) and displayed', { timeout: 150000 }, async (t) => {
+test('11. HEIC photo is converted in the browser (heic-to vendored in js/vendor/, no CDN) and displayed', { timeout: 150000 }, (t) => suite.wrap('11-heic', async () => {
   await suite.admin.reset();
-  const app = await suite.newApp({ params: ROOT_PARAMS });
-  const reachable = await app.page.evaluate(async (src) => {
-    try {
-      const ctrl = new AbortController();
-      setTimeout(() => ctrl.abort(), 15000);
-      const r = await fetch(src, { method: 'HEAD', signal: ctrl.signal });
-      return r.ok;
-    } catch {
-      return false;
-    }
-  }, HEIC_TO_SRC);
-  if (!reachable) {
-    await app.close();
-    t.skip('cdn.jsdelivr.net (heic-to) is not reachable from the browser');
-    return;
-  }
-  await suite.wrap('11-heic', async () => {
-    await app.waitForPlayer();
-    const e = await jumpTo(app, 'img_arctic_circle_heic', 90000);
-    assert.match(e.src, /^blob:/, `converted image is a blob (not the Drive thumbnail): ${e.src}`);
-    assert.equal(e.nw, 1280);
-    assert.equal(e.nh, 853);
-    assert.ok(colorNear(e.color, suite.byId.img_arctic_circle_heic._test.bgColor, 32), `colour ${e.color} vs ${suite.byId.img_arctic_circle_heic._test.bgColor}`);
-    const loaded = await app.page.evaluate(() => performance.getEntriesByType('resource').map((r) => r.name).filter((n) => n.includes('heic-to')));
-    assert.ok(loaded.length > 0, 'heic-to was loaded');
-    // the original HEIC bytes were downloaded (not only the thumbnail)
-    const reqs = (await suite.admin.log()).filter((x) => x.path === '/drive/v3/files/img_arctic_circle_heic' && x.query.alt === 'media' && !x.range);
-    assert.ok(reqs.some((x) => x.status === 200));
-    await app.screenshot('heic-slide');
-    assertNoPageErrors(app);
-    await app.close();
-  })(t);
-});
+  const app = await suite.newApp({ params: ROOT_PARAMS, navigate: false });
+  // no third-party CDN may be contacted for the conversion
+  const external = [];
+  await app.context.route(/^https:\/\/(cdn\.jsdelivr\.net|unpkg\.com|esm\.sh|cdnjs\.cloudflare\.com)\//, (route) => {
+    external.push(route.request().url());
+    return route.abort('internetdisconnected');
+  });
+  await app.goto();
+  await app.waitForPlayer();
+  const e = await jumpTo(app, 'img_arctic_circle_heic', 90000);
+  assert.match(e.src, /^blob:/, `converted image is a blob (not the Drive thumbnail): ${e.src}`);
+  assert.equal(e.nw, 1280);
+  assert.equal(e.nh, 853);
+  assert.ok(colorNear(e.color, suite.byId.img_arctic_circle_heic._test.bgColor, 32), `colour ${e.color} vs ${suite.byId.img_arctic_circle_heic._test.bgColor}`);
+  const loaded = await app.page.evaluate(() => performance.getEntriesByType('resource').map((r) => r.name).filter((n) => n.includes('heic-to')));
+  assert.ok(loaded.length > 0, 'heic-to was loaded');
+  for (const u of loaded) assert.equal(new URL(u).pathname, '/js/vendor/heic-to.js', `heic-to comes from the app origin: ${u}`);
+  assert.deepEqual(external, [], 'no CDN requests');
+  // the original HEIC bytes were downloaded (not only the thumbnail)
+  const reqs = (await suite.admin.log()).filter((x) => x.path === '/drive/v3/files/img_arctic_circle_heic' && x.query.alt === 'media' && !x.range);
+  assert.ok(reqs.some((x) => x.status === 200));
+  await app.screenshot('heic-slide');
+  assertNoPageErrors(app);
+  await app.close();
+})(t));
 
-test('11c. HEIC with the conversion library unreachable (CDN blocked) falls back to the Drive thumbnail', { timeout: 120000 }, (t) => suite.wrap('11c-heic-no-cdn', async () => {
+test('11c. HEIC with the conversion library unreachable (js/vendor/heic-to.js blocked) falls back to the Drive thumbnail', { timeout: 120000 }, (t) => suite.wrap('11c-heic-no-lib', async () => {
   await suite.admin.reset();
   const app = await suite.newApp({ params: ROOT_PARAMS, navigate: false });
   let blocked = 0;
-  await app.context.route('https://cdn.jsdelivr.net/**', (route) => {
+  await app.context.route('**/js/vendor/heic-to.js', (route) => {
     blocked++;
     return route.abort('internetdisconnected');
   });

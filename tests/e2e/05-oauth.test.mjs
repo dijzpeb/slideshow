@@ -15,7 +15,7 @@ after(async () => {
 
 const TOKEN_KEY = 'finland-slideshow.token.v1';
 
-test('9a. OAuth: folder_private loads after clicking start (token requested via GIS), photos come through the SW with the Bearer token', { timeout: 120000 }, (t) => suite.wrap('09a-oauth', async () => {
+test('9a. OAuth: folder_private loads after clicking start (token requested via GIS), photos are downloaded with the Bearer token', { timeout: 120000 }, (t) => suite.wrap('09a-oauth', async () => {
   await suite.admin.reset();
   const app = await suite.newApp({ navigate: false });
   const { page } = app;
@@ -50,8 +50,8 @@ test('9a. OAuth: folder_private loads after clicking start (token requested via 
       assert.equal(e.authOk, true);
       assert.equal(e.query.key, undefined, 'no API key in OAuth mode');
     }
-    // the SW (origin = app) fetched the full photo
-    assert.ok(reqs.some((e) => e.origin === suite.env.appUrl && !e.range && e.status === 200), `${id}: full download via SW`);
+    // the app (origin = app) fetched the full photo
+    assert.ok(reqs.some((e) => e.origin === suite.env.appUrl && !e.range && e.status === 200), `${id}: full download`);
   }
   assert.ok(log.filter((e) => e.method === 'GET' && !e.path.startsWith('/thumb/')).every((e) => e.auth === 'bearer'), 'every API call used the bearer token');
   // the token is kept for this tab only
@@ -255,7 +255,7 @@ test('9f. OAuth: login popup closed / access denied → Japanese error on the se
   await app.close();
 })(t));
 
-test('9g. [APP BUG] two tabs with different credentials (OAuth tab + API-key tab): the Service Worker must use each tab\'s own credentials', { timeout: 120000 }, (t) => suite.wrap('09g-two-tabs', async () => {
+test('9g. two tabs with different credentials (OAuth tab + API-key tab): the Service Worker must use each tab\'s own credentials', { timeout: 120000 }, (t) => suite.wrap('09g-two-tabs', async () => {
   await suite.admin.reset();
   // tab B: OAuth, private folder (photos need the bearer token)
   const B = await suite.newApp({ navigate: false });
@@ -278,8 +278,19 @@ test('9g. [APP BUG] two tabs with different credentials (OAuth tab + API-key tab
   const reqs = mediaRequests(await suite.admin.log(), 'img_private_1');
   const summary = reqs.map((r) => `${r.auth}→${r.status}`).join(', ');
   assert.ok(reqs.every((r) => r.auth === 'bearer'), `tab B's photo was requested with another tab's credentials: ${summary} `
-    + '(sw.js keeps one global `creds` for all clients; the last tab to push wins)');
+    + '(sw.js must keep credentials per client)');
   assert.match(e.src, /^blob:/, `tab B shows the original photo, not a thumbnail fallback (${e.src})`);
+  // media elements of tab B go through the Service Worker: it must use tab B's credentials, not tab A's
+  await suite.admin.clearLog();
+  const viaSw = await B.page.evaluate(() => new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => resolve({ ok: true, w: img.naturalWidth });
+    img.onerror = () => resolve({ ok: false });
+    img.src = `__drive/media/img_private_1?mt=image%2Fjpeg&t=${Date.now()}`;
+  }));
+  const swReqs = mediaRequests(await suite.admin.log(), 'img_private_1');
+  assert.ok(swReqs.length > 0 && swReqs.every((r) => r.auth === 'bearer'), `SW request credentials: ${swReqs.map((r) => `${r.auth}→${r.status}`)}`);
+  assert.ok(viaSw.ok && viaSw.w > 0, 'tab B <img> through the SW loads');
   await A.close();
   await B.close();
 })(t));

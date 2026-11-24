@@ -1,7 +1,7 @@
 // 設定の既定値・保存・URL パラメータ
 
 import { isValidTimeZone } from './timeutil.js';
-import { DRIVE_API_DEFAULT } from './drive.js';
+import { DRIVE_API_DEFAULT, parseFolderInput } from './drive.js';
 
 const STORAGE_KEY = 'finland-slideshow.settings.v1';
 
@@ -26,8 +26,76 @@ export const DEFAULTS = Object.freeze({
   timeZone: 'Europe/Helsinki',
   imageQuality: 'original', // 'original' | 'fast'
   preciseTimes: true, // 写真の EXIF をファイルから直接読んで撮影時刻を補正する
-  cameraOffsets: {}, // { [カメラ名]: 分 }
+  cameraOffsets: {}, // { [フォルダ ID]: { [補正グループ名]: 分 } }
 });
+
+const MAX_OFFSET_MINUTES = 48 * 60;
+const MAX_OFFSET_FOLDERS = 50;
+const MAX_OFFSET_GROUPS = 100;
+const MAX_LABEL_LENGTH = 200;
+const FOLDER_ID_RE = /^[-\w]{1,200}$/;
+
+const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+const isPlainObject = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
+const validFolderId = (id) => typeof id === 'string' && FOLDER_ID_RE.test(id) && id !== '__proto__';
+
+/** 分を整数にして ±48 時間に丸める（数値でなければ null） */
+function toOffsetMinutes(v) {
+  if (typeof v !== 'number' && typeof v !== 'string') return null;
+  if (typeof v === 'string' && !v.trim()) return null;
+  const n = Math.round(Number(v));
+  if (!Number.isFinite(n)) return null;
+  return Math.min(MAX_OFFSET_MINUTES, Math.max(-MAX_OFFSET_MINUTES, n));
+}
+
+/** { [グループ名]: 分 } を検証する（0 や不正な値は除く） */
+function sanitizeGroupOffsets(raw) {
+  const out = {};
+  if (!isPlainObject(raw)) return out;
+  let n = 0;
+  for (const [k, v] of Object.entries(raw)) {
+    if (n >= MAX_OFFSET_GROUPS) break;
+    if (!k || k.length > MAX_LABEL_LENGTH || k === '__proto__') continue;
+    const m = toOffsetMinutes(v);
+    if (!m) continue;
+    out[k] = m;
+    n++;
+  }
+  return out;
+}
+
+/** { [フォルダ ID]: { [グループ名]: 分 } } を検証する。旧形式（フォルダ別でない { グループ名: 分 }）は捨てる（loadSettings で移行済み） */
+function sanitizeFolderOffsets(raw) {
+  const out = {};
+  if (!isPlainObject(raw)) return out;
+  const entries = [];
+  for (const [fid, groups] of Object.entries(raw)) {
+    if (!validFolderId(fid) || !isPlainObject(groups)) continue;
+    const g = sanitizeGroupOffsets(groups);
+    if (Object.keys(g).length) entries.push([fid, g]);
+  }
+  // 上限を超えたら古いもの（先頭）から捨てる。withFolderOffsets は更新したフォルダを末尾に置く
+  for (const [fid, g] of entries.slice(-MAX_OFFSET_FOLDERS)) out[fid] = g;
+  return out;
+}
+
+/** このフォルダのカメラ別補正 { [補正グループ名]: 分 }（buildCatalog の cameraOffsets に渡す） */
+export function offsetsForFolder(settings, folderId) {
+  const all = settings && settings.cameraOffsets;
+  if (!isPlainObject(all) || !validFolderId(folderId) || !hasOwn(all, folderId)) return {};
+  return sanitizeGroupOffsets(all[folderId]);
+}
+
+/** このフォルダの補正を offsets に置き換えた新しい設定を返す（空ならフォルダごと消す。元の設定は変えない） */
+export function withFolderOffsets(settings, folderId, offsets) {
+  const base = settings || {};
+  const all = sanitizeFolderOffsets(base.cameraOffsets);
+  if (!validFolderId(folderId)) return { ...base, cameraOffsets: all };
+  delete all[folderId];
+  const groups = sanitizeGroupOffsets(offsets);
+  if (Object.keys(groups).length) all[folderId] = groups;
+  return { ...base, cameraOffsets: sanitizeFolderOffsets(all) };
+}
 
 function clampNum(v, min, max, def) {
   const n = Number(v);
@@ -63,26 +131,40 @@ export function sanitize(raw) {
   out.loop = bool(s.loop, DEFAULTS.loop);
   out.includeSubfolders = bool(s.includeSubfolders, DEFAULTS.includeSubfolders);
   out.refreshMinutes = clampNum(s.refreshMinutes, 0, 1440, DEFAULTS.refreshMinutes);
-  out.timeZone = isValidTimeZone(s.timeZone) ? s.timeZone : DEFAULTS.timeZone;
+  const tz = typeof s.timeZone === 'string' ? s.timeZone.trim() : '';
+  out.timeZone = isValidTimeZone(tz) ? tz : DEFAULTS.timeZone;
   out.imageQuality = s.imageQuality === 'fast' ? 'fast' : 'original';
   out.preciseTimes = bool(s.preciseTimes, DEFAULTS.preciseTimes);
-  out.cameraOffsets = {};
-  if (s.cameraOffsets && typeof s.cameraOffsets === 'object') {
-    for (const [k, v] of Object.entries(s.cameraOffsets)) {
-      const n = Math.round(Number(v));
-      if (k && Number.isFinite(n) && n !== 0 && Math.abs(n) <= 48 * 60) out.cameraOffsets[k] = n;
-    }
-  }
+  out.cameraOffsets = sanitizeFolderOffsets(s.cameraOffsets);
   return out;
 }
 
 function readStored() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : {};
+    const v = raw ? JSON.parse(raw) : {};
+    return isPlainObject(v) ? v : {};
   } catch {
     return {};
   }
+}
+
+/**
+ * 以前の版で保存した補正（フォルダ別でない { グループ名: 分 }）を、そのとき保存されていたフォルダの分に移す。
+ * フォルダが分からなければ旧形式の分は捨てる
+ */
+export function migrateStoredOffsets(stored, fallbackFolder = '') {
+  const co = stored && stored.cameraOffsets;
+  if (!isPlainObject(co)) return stored;
+  const flat = Object.entries(co).filter(([, v]) => !isPlainObject(v));
+  if (!flat.length) return stored;
+  const nested = Object.fromEntries(Object.entries(co).filter(([, v]) => isPlainObject(v)));
+  const folderId = parseFolderInput(String(stored.folder || fallbackFolder || ''))?.id;
+  if (folderId && validFolderId(folderId)) {
+    // 新しい形式で保存済みの値を優先し、旧形式の値は足りない分だけ補う
+    nested[folderId] = { ...Object.fromEntries(flat), ...(isPlainObject(nested[folderId]) ? nested[folderId] : {}) };
+  }
+  return { ...stored, cameraOffsets: nested };
 }
 
 export function saveSettings(settings) {
@@ -124,6 +206,21 @@ export function settingsFromUrl(search) {
   if (o.authMode === 'key') o.authMode = 'apikey';
   // API キーだけが指定された共有リンクは API キーモード
   if (o.apiKey && !o.authMode) o.authMode = 'apikey';
+  // カメラ別補正: fix=<分>:<グループ名>（複数可）。URL のフォルダの分として読む。
+  // 0 も残す（loadSettings で保存済みの補正を打ち消せるように）
+  const folderId = parseFolderInput(o.folder || '')?.id;
+  if (folderId && validFolderId(folderId)) {
+    const groups = {};
+    let n = 0;
+    for (const v of p.getAll('fix')) {
+      const m = /^\s*([+-]?\d{1,6})\s*:([\s\S]+)$/.exec(v);
+      const label = m ? m[2].trim() : '';
+      if (!label || label.length > MAX_LABEL_LENGTH || label === '__proto__') continue;
+      if (!hasOwn(groups, label) && n++ >= MAX_OFFSET_GROUPS) break;
+      groups[label] = toOffsetMinutes(m[1]);
+    }
+    if (n) o.cameraOffsets = { [folderId]: groups };
+  }
   return o;
 }
 
@@ -141,9 +238,20 @@ export function loadSettings(deployConfig = {}, search = '') {
   if (dc.timeZone) fromDeploy.timeZone = dc.timeZone;
   if (dc.authMode) fromDeploy.authMode = dc.authMode;
   else if (dc.apiKey && !dc.clientId) fromDeploy.authMode = 'apikey';
-  const stored = readStored();
+  const stored = migrateStoredOffsets(readStored(), fromDeploy.folder);
   const fromUrl = settingsFromUrl(search);
-  return sanitize({ ...fromDeploy, ...stored, ...fromUrl });
+  const merged = { ...fromDeploy, ...stored, ...fromUrl };
+  if (fromUrl.cameraOffsets) {
+    // URL の補正はそのフォルダの保存済みの補正に上書きでまとめる（他のフォルダはそのまま）
+    const all = sanitizeFolderOffsets(stored && stored.cameraOffsets);
+    for (const [fid, groups] of Object.entries(fromUrl.cameraOffsets)) {
+      const prev = hasOwn(all, fid) ? all[fid] : {};
+      delete all[fid];
+      all[fid] = { ...prev, ...groups };
+    }
+    merged.cameraOffsets = all;
+  }
+  return sanitize(merged);
 }
 
 /** 同じ設定で開ける共有用 URL を作る（OAuth の場合は各自がログインする） */
@@ -161,6 +269,13 @@ export function buildShareUrl(baseUrl, settings) {
   }
   if (settings.timeZone !== DEFAULTS.timeZone) u.searchParams.set('tz', settings.timeZone);
   if (settings.title) u.searchParams.set('title', settings.title);
+  // このフォルダのカメラ別補正（分を先に書くのでグループ名に ':' があってもよい）
+  const folderId = parseFolderInput(settings.folder || '')?.id;
+  if (folderId) {
+    for (const [group, minutes] of Object.entries(offsetsForFolder(settings, folderId))) {
+      u.searchParams.append('fix', `${minutes}:${group}`);
+    }
+  }
   return u.toString();
 }
 

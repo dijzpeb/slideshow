@@ -3,14 +3,35 @@
 import { AuthRequiredError } from './drive.js';
 import { RangeReader, readJpegExifThumbnail } from './mediatime.js';
 
-// HEIC を表示できないブラウザ（Safari 以外）向けの変換ライブラリ。必要になったときだけ読み込む
-const HEIC_TO_SRC = 'https://cdn.jsdelivr.net/npm/heic-to@1.6.7/dist/heic-to.js';
+// HEIC を表示できないブラウザ（Safari 以外）向けの変換ライブラリ（js/vendor/ に同梱）。必要になったときだけ読み込む
+const HEIC_TO_SRC = new URL('./vendor/heic-to.js', import.meta.url).href;
+
+/** 写真の元ファイルの一時的なエラー（429 / 5xx）を再試行する回数 */
+const PHOTO_RETRIES = 3;
+
+/** promise が ms 以内に決着しなければ null で解決する（後から失敗しても未処理にはならない） */
+function withTimeout(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const t = setTimeout(() => resolve(null), ms);
+    Promise.resolve(promise).then(
+      (v) => {
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(t);
+        reject(e);
+      },
+    );
+  });
+}
 
 /** Service Worker を登録し、ページを制御下に置く。使えない環境では null */
 export async function setupServiceWorker({ getCreds, timeoutMs = 4000 } = {}) {
   if (!('serviceWorker' in navigator) || !window.isSecureContext) return null;
+  const container = navigator.serviceWorker;
   try {
-    navigator.serviceWorker.addEventListener('message', async (event) => {
+    container.addEventListener('message', async (event) => {
       const data = event.data || {};
       if (data.type !== 'need-creds' || !event.ports || !event.ports[0]) return;
       let creds = null;
@@ -21,12 +42,16 @@ export async function setupServiceWorker({ getCreds, timeoutMs = 4000 } = {}) {
       }
       event.ports[0].postMessage({ type: 'creds', creds });
     });
-    const reg = await navigator.serviceWorker.register('./sw.js', { scope: './' });
-    await navigator.serviceWorker.ready;
-    if (!navigator.serviceWorker.controller) {
+    const reg = await withTimeout(container.register('./sw.js', { scope: './' }), timeoutMs);
+    // ブラウザの設定などで Service Worker が有効にならないと ready はいつまでも解決しない
+    if (!reg || !(await withTimeout(container.ready, timeoutMs))) {
+      console.warn('Service Worker が有効になりませんでした');
+      return null;
+    }
+    if (!container.controller) {
       await new Promise((resolve) => {
         const t = setTimeout(resolve, timeoutMs);
-        navigator.serviceWorker.addEventListener(
+        container.addEventListener(
           'controllerchange',
           () => {
             clearTimeout(t);
@@ -36,7 +61,7 @@ export async function setupServiceWorker({ getCreds, timeoutMs = 4000 } = {}) {
         );
       });
     }
-    if (!navigator.serviceWorker.controller) return null; // 強制再読み込み（Shift+リロード）時など
+    if (!container.controller) return null; // 強制再読み込み（Shift+リロード）時など
     // 実際に応答するか確認
     const ok = await new Promise((resolve) => {
       const ch = new MessageChannel();
@@ -45,14 +70,16 @@ export async function setupServiceWorker({ getCreds, timeoutMs = 4000 } = {}) {
         clearTimeout(t);
         resolve(true);
       };
-      navigator.serviceWorker.controller.postMessage({ type: 'ping' }, [ch.port2]);
+      container.controller.postMessage({ type: 'ping' }, [ch.port2]);
     });
     if (!ok) return null;
     return {
       registration: reg,
       scope: reg.scope,
+      /** このタブの接続情報を渡す（Service Worker はタブごとに保持する。null はこのタブの分を消す） */
       pushCreds(creds) {
-        navigator.serviceWorker.controller?.postMessage({ type: 'creds', creds });
+        const target = container.controller || reg.active;
+        target?.postMessage({ type: 'creds', creds: creds || null });
       },
     };
   } catch (e) {
@@ -76,23 +103,48 @@ function isHeic(item) {
   return /^image\/hei[cf]/i.test(item.mimeType) || /\.(heic|heif)$/i.test(item.name);
 }
 
+/** 中止（別の写真へ移った等）を表すエラー。呼び出し側はトーストを出さない */
+function abortError() {
+  return new DOMException('写真の読み込みを中止しました', 'AbortError');
+}
+
+function throwIfAborted(signal) {
+  if (signal && signal.aborted) throw abortError();
+}
+
 /** 画像の URL が表示できるか（デコードできるか）を確かめる */
-function probeImage(url, timeoutMs = 30000) {
+function probeImage(url, timeoutMs = 30000, signal = null) {
   return new Promise((resolve, reject) => {
+    if (signal && signal.aborted) {
+      reject(abortError());
+      return;
+    }
     const img = new Image();
     img.decoding = 'async';
+    const onAbort = () => {
+      clearTimeout(t);
+      img.onload = img.onerror = null;
+      img.src = '';
+      reject(abortError());
+    };
     const t = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
       img.src = '';
       reject(new Error('画像の読み込みがタイムアウトしました'));
     }, timeoutMs);
+    signal?.addEventListener('abort', onAbort, { once: true });
     img.onload = () => {
       clearTimeout(t);
-      const done = () => resolve({ width: img.naturalWidth, height: img.naturalHeight });
+      const done = () => {
+        signal?.removeEventListener('abort', onAbort);
+        resolve({ width: img.naturalWidth, height: img.naturalHeight });
+      };
       if (img.decode) img.decode().then(done, done);
       else done();
     };
     img.onerror = () => {
       clearTimeout(t);
+      signal?.removeEventListener('abort', onAbort);
       reject(new Error('画像を表示できませんでした'));
     };
     img.src = url;
@@ -123,7 +175,8 @@ export class MediaLoader {
     this.drive = drive;
     this.sw = sw;
     this.getSettings = getSettings;
-    this.cache = new Map(); // id -> {promise, url, revoke, lastUsed}
+    this.cache = new Map(); // id -> {id, sig, promise, ctrl, settled, lastUsed, waiters, pinned}
+    this._keepBatch = null; // _cancelOthers() でまとめて残す id
     this.maxCached = 8;
     this.thumbFailed = false; // サムネイル URL が使えない環境か（非公開ファイルでは使えないことが多い）
     this.thumbFailures = 0;
@@ -163,83 +216,152 @@ export class MediaLoader {
     if (e) e.lastUsed = performance.now();
   }
 
+  /** 読み込み中の写真のダウンロード・変換を中止し、キャッシュから外す（次の要求で読み直す） */
+  _abortEntry(e) {
+    if (this.cache.get(e.id) === e) this.cache.delete(e.id);
+    if (!e.settled) e.ctrl.abort(abortError());
+  }
+
   _evict(keep) {
     if (this.cache.size <= this.maxCached) return;
     const entries = [...this.cache.entries()].filter(([id]) => !keep.has(id)).sort((a, b) => a[1].lastUsed - b[1].lastUsed);
     while (this.cache.size > this.maxCached && entries.length) {
-      const [id, e] = entries.shift();
-      this.cache.delete(id);
+      const [, e] = entries.shift();
+      this._abortEntry(e);
       e.promise.then((r) => r && r.revoke && r.revoke()).catch(() => {});
     }
   }
 
-  /** 保持している写真のうち keepIds 以外を解放する */
+  /**
+   * keep に含まれない読み込み中の写真を中止する（スキップされた写真が帯域を使い続けないように）。
+   * 同じタスク内の呼び出し（表示する写真 + 先読みの一連の呼び出し）はまとめて扱い、その全部を残す。
+   */
+  _cancelOthers(keepIds) {
+    if (!this._keepBatch) {
+      const batch = new Set();
+      this._keepBatch = batch;
+      queueMicrotask(() => {
+        if (this._keepBatch === batch) this._keepBatch = null;
+        for (const [id, e] of [...this.cache]) if (!e.settled && !batch.has(id)) this._abortEntry(e);
+      });
+    }
+    for (const id of keepIds) this._keepBatch.add(id);
+  }
+
+  /** 保持している写真のうち keepIds 以外を解放し、keepIds 以外の読み込みは中止する */
   retain(keepIds) {
     const keep = new Set(keepIds);
     this._evict(keep);
+    this._cancelOthers(keep);
   }
 
   /**
    * 写真を読み込む。戻り値 {url, width, height, via, revoke}
+   * keep を渡すと、item と keep 以外の読み込み中の写真を中止する（中止された側は AbortError で失敗する）。
+   * signal を渡すと、その中止で戻り値が AbortError になる。この写真を待つ呼び出しが
+   * すべて中止されたときはダウンロードも中止する。
    */
-  loadImage(item, { keep = [] } = {}) {
-    const hit = this.cache.get(item.id);
-    if (hit && hit.sig === item.modifiedTime) {
+  loadImage(item, { keep, signal } = {}) {
+    if (signal && signal.aborted) return Promise.reject(abortError());
+    let entry = this.cache.get(item.id);
+    if (entry && entry.sig === item.modifiedTime) {
       this._touch(item.id);
-      return hit.promise;
+    } else {
+      entry = this._startImage(item);
+      this._evict(new Set([item.id, ...(keep || [])]));
     }
-    const entry = { sig: item.modifiedTime, lastUsed: performance.now(), promise: null };
-    entry.promise = this._loadImage(item).catch((e) => {
-      if (this.cache.get(item.id) === entry) this.cache.delete(item.id);
-      throw e;
+    if (keep) this._cancelOthers([item.id, ...keep]);
+    if (!signal) {
+      entry.pinned = true;
+      return entry.promise;
+    }
+    entry.waiters++;
+    return new Promise((resolve, reject) => {
+      const onAbort = () => {
+        reject(abortError());
+        if (--entry.waiters === 0 && !entry.pinned && !entry.settled) this._abortEntry(entry);
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      entry.promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
     });
-    this.cache.set(item.id, entry);
-    this._evict(new Set([item.id, ...keep]));
-    return entry.promise;
   }
 
-  async _loadImage(item) {
+  _startImage(item) {
+    const ctrl = new AbortController();
+    const entry = { id: item.id, sig: item.modifiedTime, lastUsed: performance.now(), promise: null, ctrl, settled: false, waiters: 0, pinned: false };
+    const work = this._loadImage(item, ctrl.signal);
+    entry.promise = new Promise((resolve, reject) => {
+      const settle = (fn, v) => {
+        if (entry.settled) return false;
+        entry.settled = true;
+        ctrl.signal.removeEventListener('abort', onAbort);
+        fn(v);
+        return true;
+      };
+      const onAbort = () => settle(reject, abortError());
+      ctrl.signal.addEventListener('abort', onAbort, { once: true });
+      work.then(
+        (r) => {
+          if (!settle(resolve, r)) r && r.revoke && r.revoke(); // 中止後に届いた結果は捨てる
+        },
+        (e) => settle(reject, e),
+      );
+    });
+    entry.promise.catch(() => {
+      if (this.cache.get(item.id) === entry) this.cache.delete(item.id);
+    });
+    this.cache.set(item.id, entry);
+    return entry;
+  }
+
+  async _loadImage(item, signal) {
     const settings = this.getSettings();
     const errors = [];
     // 高速モード: Google が生成した縮小画像を使う（HEIC も JPEG で返ってくる）
     if (settings.imageQuality === 'fast' && item.thumbnailLink && !this.thumbFailed) {
       try {
-        return await this._loadThumbnail(item);
+        return await this._loadThumbnail(item, signal);
       } catch (e) {
+        throwIfAborted(signal);
         errors.push(e);
       }
     }
     // 元画像
     let blob = null;
     try {
-      blob = await this._fetchBlob(item);
+      blob = await this._fetchBlob(item, { signal });
     } catch (e) {
       if (e instanceof AuthRequiredError) throw e;
+      throwIfAborted(signal);
       errors.push(e);
     }
     if (blob) {
       const url = URL.createObjectURL(blob);
       try {
-        const dim = await probeImage(url);
+        const dim = await probeImage(url, 30000, signal);
         return { url, ...dim, via: 'original', revoke: () => URL.revokeObjectURL(url) };
       } catch (e) {
         URL.revokeObjectURL(url);
+        throwIfAborted(signal);
         errors.push(e);
       }
       // HEIC はブラウザが対応していなければ変換する（Safari 17 以降は上でそのまま表示できる）
       if (isHeic(item)) {
         try {
           const { heicTo } = await loadHeicTo();
+          throwIfAborted(signal); // 変換は途中で止められないので、始める前に確認
           const out = await heicTo({ blob, type: 'image/jpeg', quality: 0.9 });
+          throwIfAborted(signal);
           const url2 = URL.createObjectURL(out);
           try {
-            const dim = await probeImage(url2);
+            const dim = await probeImage(url2, 30000, signal);
             return { url: url2, ...dim, via: 'heic', revoke: () => URL.revokeObjectURL(url2) };
           } catch (e) {
             URL.revokeObjectURL(url2);
             throw e;
           }
         } catch (e) {
+          throwIfAborted(signal);
           errors.push(e);
         }
       }
@@ -247,8 +369,9 @@ export class MediaLoader {
     // 最後の手段: サムネイル
     if (item.thumbnailLink && settings.imageQuality !== 'fast') {
       try {
-        return await this._loadThumbnail(item);
+        return await this._loadThumbnail(item, signal);
       } catch (e) {
+        throwIfAborted(signal);
         errors.push(e);
       }
     }
@@ -257,14 +380,14 @@ export class MediaLoader {
     throw err;
   }
 
-  async _loadThumbnail(item) {
+  async _loadThumbnail(item, signal = null) {
     const url = resizeThumbnailLink(item.thumbnailLink, this.screenSize());
     try {
-      const dim = await probeImage(url, 20000);
+      const dim = await probeImage(url, 20000, signal);
       this.thumbFailures = 0;
       return { url, ...dim, via: 'thumbnail', revoke: () => {} };
     } catch (e) {
-      this.noteThumbnailFailure();
+      if (!(signal && signal.aborted)) this.noteThumbnailFailure();
       throw e;
     }
   }
@@ -324,18 +447,14 @@ export class MediaLoader {
     return URL.createObjectURL(blob);
   }
 
-  async _fetchBlob(item) {
-    const sw = this.swUrl(item);
-    if (sw) {
-      const res = await fetch(sw, { credentials: 'same-origin' });
-      if (res.status === 401) {
-        if (this.drive.mode === 'oauth') throw new AuthRequiredError();
-        throw new Error('認証エラー');
-      }
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      return res.blob();
-    }
-    const res = await this.drive.fetchMedia(item.id);
+  /**
+   * 写真の元ファイルをページから直接ダウンロードする（Service Worker は通さない）。
+   * Service Worker 経由だと、別の写真へ移って中止してもブラウザ（Chromium）が中止を Service Worker に
+   * 伝えないため、スキップした写真のダウンロードや再試行が続いてしまう
+   */
+  async _fetchBlob(item, { signal } = {}) {
+    if (item.resourceKey) this.drive.rememberResourceKey(item.id, item.resourceKey);
+    const res = await this.drive.fetchMedia(item.id, { signal, retries: PHOTO_RETRIES });
     return res.blob();
   }
 
@@ -372,7 +491,10 @@ export class MediaLoader {
   }
 
   clear() {
-    for (const e of this.cache.values()) e.promise.then((r) => r && r.revoke && r.revoke()).catch(() => {});
+    for (const e of [...this.cache.values()]) {
+      this._abortEntry(e);
+      e.promise.then((r) => r && r.revoke && r.revoke()).catch(() => {});
+    }
     this.cache.clear();
     for (const p of this.exifThumbs.values()) p.then((u) => u && URL.revokeObjectURL(u)).catch(() => {});
     this.exifThumbs.clear();

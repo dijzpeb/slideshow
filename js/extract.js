@@ -6,6 +6,13 @@ import { mapLimit, AuthRequiredError, normalizeMimeType } from './drive.js';
 
 const CACHE_KEY = 'finland-slideshow.meta.v1';
 const CACHE_MAX = 5000;
+// 解析処理を変えたら上げる（古い解析結果は読み直す）。2: 動画の機種名（Android / Canon）、EXIF の時差タグの選び方
+const PARSER_VERSION = 2;
+
+/** キャッシュの項目がこのファイルの今の解析結果として使えるか */
+function usable(entry, file) {
+  return !!entry && entry.v === PARSER_VERSION && entry.sig === fileSignature(file);
+}
 
 function loadCache() {
   try {
@@ -52,7 +59,7 @@ export function readCached(files, phases = ['required', 'refine']) {
   for (const f of files) {
     if (!phases.includes(extractionPhase(f))) continue;
     const c = cache[f.id];
-    if (c && c.sig === fileSignature(f)) result.set(f.id, c.data);
+    if (usable(c, f)) result.set(f.id, c.data);
   }
   return result;
 }
@@ -71,9 +78,8 @@ export async function extractAll(drive, files, { phases = ['required'], signal, 
   const todo = [];
   for (const f of files) {
     if (!phases.includes(extractionPhase(f))) continue;
-    const sig = fileSignature(f);
     const c = cache[f.id];
-    if (c && c.sig === sig) {
+    if (usable(c, f)) {
       result.set(f.id, c.data);
     } else {
       todo.push(f);
@@ -103,7 +109,7 @@ export async function extractAll(drive, files, { phases = ['required'], signal, 
     result.set(f.id, data);
     onResult?.(f.id, data);
     if (cacheable) {
-      cache[f.id] = { sig: fileSignature(f), data, at: Date.now() };
+      cache[f.id] = { sig: fileSignature(f), v: PARSER_VERSION, data, at: Date.now() };
       dirty = true;
     }
     done++;

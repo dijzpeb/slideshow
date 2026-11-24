@@ -1,6 +1,24 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { buildCatalog, buildSlides, resolveCaptureTime, needsExtraction, extractionPhase, cameraLabel, cameraGroup, summarizeGroups, tripSummary } from '../../js/catalog.js';
+import {
+  buildCatalog,
+  buildSlides,
+  resolveCaptureTime,
+  needsExtraction,
+  extractionPhase,
+  cameraLabel,
+  cameraGroup,
+  correctionGroup,
+  hasExplicitOffset,
+  summarizeGroups,
+  tripSummary,
+  mainDayRange,
+  ZONED_GROUP_SUFFIX,
+  MVHD_VIDEO_GROUP_SUFFIX,
+  offsetMatchesZone,
+  UNKNOWN_PHOTO_GROUP,
+  UNKNOWN_VIDEO_GROUP,
+} from '../../js/catalog.js';
 import { parseFolderInput, mediaKind, normalizeMimeType, escapeQueryValue } from '../../js/drive.js';
 import { sanitize, settingsFromUrl, loadSettings, buildShareUrl, resolveApiBase, DEFAULTS } from '../../js/settings.js';
 
@@ -115,6 +133,184 @@ test('cameraLabel / cameraGroup / summarizeGroups', () => {
   assert.ok(g.find((x) => x.group === 'Canon EOS R6'));
 });
 
+test('correctionGroup: times with an explicit UTC offset get their own group', () => {
+  const sony = { id: 's', name: 'DSC01234.JPG', mimeType: 'image/jpeg', imageMediaMetadata: { time: '2025:07:13 19:05:00', cameraMake: 'SONY', cameraModel: 'ILCE-7M4' } };
+  assert.equal(ZONED_GROUP_SUFFIX, '（タイムゾーン記録あり）');
+  // Drive の時刻（現地時刻として解釈）→ カメラ名のまま
+  assert.equal(correctionGroup(sony, null, 'image', 'exif'), 'SONY ILCE-7M4');
+  // EXIF のオフセット付き → 別グループ
+  assert.equal(correctionGroup(sony, null, 'image', 'exif-offset'), 'SONY ILCE-7M4（タイムゾーン記録あり）');
+  // カメラ不明の写真・動画は「機種不明」が基本
+  assert.equal(correctionGroup({ name: 'x.jpg' }, null, 'image', 'exif-offset'), `${UNKNOWN_PHOTO_GROUP}${ZONED_GROUP_SUFFIX}`);
+  // 動画: 時差付きの Apple / ©day は別、mvhd は同じグループ
+  const mov = { name: 'clip.mov' };
+  assert.equal(correctionGroup(mov, { make: 'Apple', model: 'iPhone 15', offsetMinutes: 180 }, 'video', 'mp4-apple'), 'Apple iPhone 15（タイムゾーン記録あり）');
+  assert.equal(correctionGroup(mov, { offsetMinutes: -300 }, 'video', 'mp4-day'), `${UNKNOWN_VIDEO_GROUP}${ZONED_GROUP_SUFFIX}`);
+  assert.equal(correctionGroup(mov, { offsetMinutes: null }, 'video', 'mp4-day'), UNKNOWN_VIDEO_GROUP);
+  assert.equal(correctionGroup(mov, { offsetMinutes: null }, 'video', 'mp4-mvhd'), UNKNOWN_VIDEO_GROUP);
+  // ファイル名: PXL_ は UTC → 別グループ、それ以外（現地時刻）はそのまま
+  assert.equal(hasExplicitOffset({ name: 'PXL_20250714_063000123.jpg' }, null, 'filename'), true);
+  assert.equal(hasExplicitOffset({ name: 'IMG_20250714_093000.jpg' }, null, 'filename'), false);
+  assert.equal(hasExplicitOffset({ name: 'x.jpg' }, null, 'drive-times'), false);
+});
+
+test('buildCatalog: a correction for the local-clock group does not apply after the EXIF offset is read (F0)', () => {
+  // Sony の時計が日本時間のまま: Drive の時刻 19:05（ヘルシンキとして読むと 16:05Z、6 時間遅い）
+  const sony = { id: 's', name: 'DSC01234.JPG', mimeType: 'image/jpeg', imageMediaMetadata: { time: '2025:07:13 19:05:00', cameraMake: 'SONY', cameraModel: 'ILCE-7M4' } };
+  const cameraOffsets = { 'SONY ILCE-7M4': -360 };
+  const before = buildCatalog([sony], null, { timeZone: TZ, cameraOffsets });
+  assert.equal(before[0].group, 'SONY ILCE-7M4');
+  assert.equal(iso(before[0].epoch), '2025-07-13T10:05:00.000Z');
+  assert.equal(before[0].offsetMinutes, -360);
+  // 精度向上で EXIF（+09:00）を読んだ後も同じ正しい時刻（補正は二重にかからない）
+  const ex = new Map([['s', { kind: 'image', wall: { y: 2025, mo: 7, d: 13, h: 19, mi: 5, s: 0, ms: 0 }, offsetMinutes: 540, tag: 'original', make: 'SONY', model: 'ILCE-7M4' }]]);
+  const after = buildCatalog([sony], ex, { timeZone: TZ, cameraOffsets });
+  assert.equal(after[0].timeSource, 'exif-offset');
+  assert.equal(after[0].group, 'SONY ILCE-7M4（タイムゾーン記録あり）');
+  assert.equal(after[0].offsetMinutes, 0);
+  assert.equal(iso(after[0].epoch), '2025-07-13T10:05:00.000Z');
+  // オフセット付きのグループにも個別に補正できる
+  const both = buildCatalog([sony], ex, { timeZone: TZ, cameraOffsets: { 'SONY ILCE-7M4（タイムゾーン記録あり）': 30 } });
+  assert.equal(iso(both[0].epoch), '2025-07-13T10:35:00.000Z');
+  // DateTime だけ（Drive の時刻なし）でもオフセットがあれば exif-offset
+  const noDrive = { id: 'n', name: 'n.jpg', mimeType: 'image/jpeg' };
+  const r = resolveCaptureTime(noDrive, { wall: { y: 2025, mo: 7, d: 13, h: 19, mi: 5, s: 0 }, offsetMinutes: 540, tag: 'datetime' }, TZ);
+  assert.equal(r.source, 'exif-offset');
+  assert.equal(iso(r.epoch), '2025-07-13T10:05:00.000Z');
+  // cameraOffsets が null / 継承プロパティ名のグループでも落ちない
+  assert.equal(buildCatalog([sony], null, { timeZone: TZ, cameraOffsets: null })[0].offsetMinutes, 0);
+  const proto = { ...sony, imageMediaMetadata: { time: '2025:07:13 19:05:00', cameraModel: 'constructor' } };
+  assert.equal(buildCatalog([proto], null, { timeZone: TZ, cameraOffsets: {} })[0].offsetMinutes, 0);
+});
+
+test('cameraGroup: videos without a camera label are grouped by file name (F2)', () => {
+  const g = (name) => cameraGroup({ name }, null, 'video');
+  assert.equal(g('GX010123.MP4'), 'GoPro（ファイル名から推定）');
+  assert.equal(g('GH011234.MP4'), 'GoPro（ファイル名から推定）');
+  assert.equal(g('GOPR0042.MP4'), 'GoPro（ファイル名から推定）');
+  assert.equal(g('MVI_0042.MP4'), 'Canon（ファイル名から推定）');
+  assert.equal(g('DJI_0001.MP4'), 'DJI（ファイル名から推定）');
+  assert.equal(g('DJI_20250713123456_0001_D.MP4'), 'DJI（ファイル名から推定）');
+  assert.equal(g('PXL_20250714_063000123.mp4'), 'スマートフォン動画（ファイル名から推定）');
+  assert.equal(g('VID_20250712_183000.mp4'), 'スマートフォン動画（ファイル名から推定）');
+  assert.equal(g('IMG_4321.MOV'), 'スマートフォン動画（ファイル名から推定）');
+  assert.equal(g('harbour_ferry.mp4'), UNKNOWN_VIDEO_GROUP);
+  assert.equal(g('GX01.mp4'), UNKNOWN_VIDEO_GROUP);
+  // 機種名が読めればそちらが優先、写真はファイル名で分けない
+  assert.equal(cameraGroup({ name: 'PXL_20250714_063000123.mp4' }, { make: 'Google', model: 'Pixel 8' }, 'video'), 'Google Pixel 8');
+  assert.equal(cameraGroup({ name: 'MVI_0042.MP4' }, { model: 'Canon EOS R6' }, 'video'), 'Canon EOS R6');
+  assert.equal(cameraGroup({ name: 'GOPR0042.JPG' }, null, 'image'), UNKNOWN_PHOTO_GROUP);
+  // Pixel の動画（ファイル名 = UTC）は、メタデータがなければ別グループ
+  const items = buildCatalog(
+    [
+      { id: 'p', name: 'PXL_20250714_063000123.mp4', mimeType: 'video/mp4' },
+      { id: 'g', name: 'GX010123.MP4', mimeType: 'video/mp4' },
+      { id: 'c', name: 'MVI_0042.MP4', mimeType: 'video/mp4' },
+    ],
+    new Map([
+      ['g', { kind: 'video', epoch: Date.UTC(2025, 6, 14, 12), source: 'mp4-mvhd', offsetMinutes: null }],
+      ['c', { kind: 'video', epoch: Date.UTC(2025, 6, 14, 20), source: 'mp4-mvhd', offsetMinutes: null, model: 'Canon EOS R6' }],
+    ]),
+    { timeZone: TZ },
+  );
+  assert.deepEqual(
+    Object.fromEntries(items.map((i) => [i.id, i.group])),
+    { p: 'スマートフォン動画（ファイル名から推定）（タイムゾーン記録あり）', g: 'GoPro（ファイル名から推定）', c: 'Canon EOS R6（動画）' },
+  );
+});
+
+test('correctionGroup: a labelled video timed by mvhd gets its own （動画） group, corrected apart from the photos (F2)', () => {
+  // Canon の時計は正しい（ヘルシンキ）。写真は現地時刻、動画の mvhd にも現地時刻（UTC として読むと 3 時間遅い）
+  const fs = [
+    { id: 'photo', name: 'IMG_0001.JPG', mimeType: 'image/jpeg', imageMediaMetadata: { time: '2025:07:13 15:00:00', cameraMake: 'Canon', cameraModel: 'Canon EOS R6' } },
+    { id: 'video', name: 'MVI_0002.MP4', mimeType: 'video/mp4' },
+  ];
+  const ex = new Map([['video', { kind: 'video', epoch: Date.UTC(2025, 6, 13, 15, 1), source: 'mp4-mvhd', offsetMinutes: null, make: 'Canon', model: 'Canon EOS R6' }]]);
+  assert.equal(MVHD_VIDEO_GROUP_SUFFIX, '（動画）');
+  const at = (offs) => Object.fromEntries(buildCatalog(fs, ex, { timeZone: TZ, cameraOffsets: offs }).map((i) => [i.id, `${i.group} ${iso(i.epoch)}`]));
+  assert.deepEqual(at({}), { photo: 'Canon EOS R6 2025-07-13T12:00:00.000Z', video: 'Canon EOS R6（動画） 2025-07-13T15:01:00.000Z' });
+  // 動画だけを -3 時間: 写真はそのまま
+  assert.deepEqual(at({ 'Canon EOS R6（動画）': -180 }), { photo: 'Canon EOS R6 2025-07-13T12:00:00.000Z', video: 'Canon EOS R6（動画） 2025-07-13T12:01:00.000Z' });
+  // 写真の補正は動画に影響しない
+  assert.equal(at({ 'Canon EOS R6': -60 }).video, 'Canon EOS R6（動画） 2025-07-13T15:01:00.000Z');
+  // Apple の creationdate（時差付き）や機種不明の mvhd には付けない
+  assert.equal(correctionGroup({ name: 'x.mov' }, { make: 'Apple', model: 'iPhone 15', offsetMinutes: 540 }, 'video', 'mp4-apple', { epoch: Date.UTC(2025, 6, 13), timeZone: TZ }), 'Apple iPhone 15（タイムゾーン記録あり）');
+  assert.equal(correctionGroup({ name: 'clip.mp4' }, { offsetMinutes: null }, 'video', 'mp4-mvhd'), UNKNOWN_VIDEO_GROUP);
+});
+
+test('correctionGroup: a recorded offset equal to the trip zone keeps the plain group, so clock-drift corrections survive refine', () => {
+  // Sony のタイムゾーン設定は正しい（+03:00）が時計が 7 分進んでいる。Drive の時刻 15:07（本当は 12:00Z）
+  const sony = { id: 's', name: 'DSC00042.JPG', mimeType: 'image/jpeg', imageMediaMetadata: { time: '2025:07:13 15:07:00', cameraMake: 'SONY', cameraModel: 'ILCE-7M4' } };
+  const cameraOffsets = { 'SONY ILCE-7M4': -7 };
+  const before = buildCatalog([sony], null, { timeZone: TZ, cameraOffsets })[0];
+  assert.equal(before.group, 'SONY ILCE-7M4');
+  assert.equal(iso(before.epoch), '2025-07-13T12:00:00.000Z');
+  // 精度向上（または preciseTimes をオンにした後）で EXIF の +03:00 を読んでも、同じグループ・同じ補正のまま
+  const ex = new Map([['s', { kind: 'image', wall: { y: 2025, mo: 7, d: 13, h: 15, mi: 7, s: 0, ms: 0 }, offsetMinutes: 180, tag: 'original', make: 'SONY', model: 'ILCE-7M4' }]]);
+  const after = buildCatalog([sony], ex, { timeZone: TZ, cameraOffsets })[0];
+  assert.equal(after.timeSource, 'exif-offset');
+  assert.equal(after.group, 'SONY ILCE-7M4');
+  assert.equal(after.offsetMinutes, -7);
+  assert.equal(iso(after.epoch), '2025-07-13T12:00:00.000Z');
+  // 冬時間（+02:00）の日付でも、その時点のオフセットと比べる
+  assert.equal(offsetMatchesZone({ offsetMinutes: 120 }, Date.UTC(2025, 0, 10, 12), TZ), true);
+  assert.equal(offsetMatchesZone({ offsetMinutes: 180 }, Date.UTC(2025, 0, 10, 12), TZ), false);
+  assert.equal(offsetMatchesZone({ offsetMinutes: null }, Date.UTC(2025, 0, 10, 12), TZ), false);
+  assert.equal(offsetMatchesZone({ offsetMinutes: 180 }, Date.UTC(2025, 6, 10, 12), 'Not/AZone'), false);
+  // 撮影地と同じオフセットの Apple 動画は機種のグループ、UTC のファイル名（PXL_）は別グループのまま
+  const at = { epoch: Date.UTC(2025, 6, 13, 9), timeZone: TZ };
+  assert.equal(correctionGroup({ name: 'x.mov' }, { make: 'Apple', model: 'iPhone 15', offsetMinutes: 180 }, 'video', 'mp4-apple', at), 'Apple iPhone 15');
+  assert.equal(correctionGroup({ name: 'PXL_20250713_090000000.mp4' }, null, 'video', 'filename', at), `スマートフォン動画（ファイル名から推定）${ZONED_GROUP_SUFFIX}`);
+});
+
+test('buildSlides / tripSummary: an outlying date does not set day 1 (F4)', () => {
+  const at = (id, isoTime, kind = 'image') => ({ id, name: `${id}.jpg`, mimeType: kind === 'image' ? 'image/jpeg' : 'video/mp4', modifiedTime: isoTime, createdTime: isoTime });
+  const fs = [
+    at('reset', '2000-01-01T10:00:00Z'), // 時計未設定のカメラ
+    at('d1a', '2025-07-12T09:00:00Z'),
+    at('d1b', '2025-07-12T12:00:00Z'),
+    at('d2', '2025-07-13T09:00:00Z'),
+    at('d4', '2025-07-15T09:00:00Z', 'video'),
+  ];
+  const items = buildCatalog(fs, null, { timeZone: TZ });
+  assert.deepEqual(items.map((i) => i.id), ['reset', 'd1a', 'd1b', 'd2', 'd4']);
+  const range = mainDayRange(items);
+  assert.deepEqual(range, { firstDay: '2025-07-12', lastDay: '2025-07-15', count: 4 });
+  const slides = buildSlides(items, { showTitleCard: true, showDayCards: true });
+  assert.deepEqual(
+    slides.map((s) => (s.type === 'media' ? s.item.id : s.type === 'day' ? `day:${s.day}:${s.dayNumber}` : s.type)),
+    ['title', 'day:2000-01-01:null', 'reset', 'day:2025-07-12:1', 'd1a', 'd1b', 'day:2025-07-13:2', 'd2', 'day:2025-07-15:4', 'd4'],
+  );
+  // 日付カードの形は変わらない（dayIndex は全体での順番）
+  const day1 = slides.find((s) => s.type === 'day' && s.day === '2025-07-12');
+  assert.deepEqual(day1, { key: 'day:2025-07-12', type: 'day', day: '2025-07-12', dayIndex: 1, dayNumber: 1, count: 2 });
+  const sum = tripSummary(items);
+  assert.equal(sum.firstDay, '2025-07-12');
+  assert.equal(sum.lastDay, '2025-07-15');
+  assert.equal(iso(sum.first), '2025-07-12T09:00:00.000Z');
+  assert.equal(iso(sum.last), '2025-07-15T09:00:00.000Z');
+  assert.equal(sum.dayCount, 3);
+  assert.deepEqual(sum.main, { first: sum.first, last: sum.last, firstDay: sum.firstDay, lastDay: sum.lastDay, dayCount: 3 });
+  assert.equal(sum.all.firstDay, '2000-01-01');
+  assert.equal(sum.all.dayCount, 4);
+  assert.equal(sum.outliers, 1);
+  assert.equal(sum.photos, 4);
+  assert.equal(sum.videos, 1);
+  // 後ろに離れた日（何年も後にアップロードした日時推定のファイル）も期間外
+  const late = buildCatalog([...fs.slice(1), at('late', '2027-03-01T09:00:00Z')], null, { timeZone: TZ });
+  const lateSlides = buildSlides(late, {});
+  assert.equal(lateSlides.find((s) => s.type === 'day' && s.day === '2027-03-01').dayNumber, null);
+  assert.equal(tripSummary(late).lastDay, '2025-07-15');
+  // 30 日以内の空きは同じまとまり（暦日で数える）
+  const near = buildCatalog([at('a', '2025-07-01T09:00:00Z'), at('b', '2025-07-31T09:00:00Z')], null, { timeZone: TZ });
+  assert.deepEqual(buildSlides(near, {}).filter((s) => s.type === 'day').map((s) => s.dayNumber), [1, 31]);
+  // 件数が同じなら早い方が主な期間
+  const two = buildCatalog([at('x', '2024-01-01T09:00:00Z'), at('y', '2025-01-01T09:00:00Z')], null, { timeZone: TZ });
+  assert.deepEqual(buildSlides(two, {}).filter((s) => s.type === 'day').map((s) => s.dayNumber), [1, null]);
+  assert.equal(tripSummary([]), null);
+  assert.equal(mainDayRange([]), null);
+});
+
 test('parseFolderInput', () => {
   const id = '1AbCdEfGhIjKlMnOpQrStUvWxYz012345';
   assert.deepEqual(parseFolderInput(`https://drive.google.com/drive/folders/${id}`), { id, resourceKey: null });
@@ -140,11 +336,11 @@ test('mediaKind / normalizeMimeType / escapeQueryValue', () => {
 });
 
 test('settings: sanitize, URL params, share URL', () => {
-  const s = sanitize({ photoSeconds: '9999', timeZone: 'Bad/Zone', captions: 'x', cameraOffsets: { a: '30', b: 0, c: 'x' } });
+  const s = sanitize({ photoSeconds: '9999', timeZone: 'Bad/Zone', captions: 'x', cameraOffsets: { F1: { a: '30', b: 0, c: 'x' } } });
   assert.equal(s.photoSeconds, 120);
   assert.equal(s.timeZone, DEFAULTS.timeZone);
   assert.equal(s.captions, 'datetime');
-  assert.deepEqual(s.cameraOffsets, { a: 30 });
+  assert.deepEqual(s.cameraOffsets, { F1: { a: 30 } });
   const u = settingsFromUrl('?folder=abc&key=KEY1&interval=3');
   assert.deepEqual(u, { folder: 'abc', apiKey: 'KEY1', photoSeconds: '3', authMode: 'apikey' });
   global.localStorage = { getItem: () => JSON.stringify({ folder: 'stored', photoSeconds: 4 }), setItem() {}, removeItem() {} };

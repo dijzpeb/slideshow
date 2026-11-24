@@ -151,7 +151,16 @@ Trip time zone default `Europe/Helsinki`:
    `YYYYMMDD_HHMMSS`, `YYYY-MM-DD HH.MM.SS` = trip zone;
 5. else `min(modifiedTime, createdTime)`.
 
-Per-camera offsets (setting) are added to times from rules 1–2 for that `cameraModel`.
+Per-camera offsets (setting `cameraOffsets`, stored per folder id: `{ [folderId]: { [group]: minutes } }`, and
+carried in share links as repeated `fix=<minutes>:<group>`) are added to the times of that correction group.
+A time read with an explicit UTC offset that differs from the trip zone's offset at that instant (EXIF
+`OffsetTime*`, Apple `creationdate` / `©day` with an offset) or from a `PXL_` filename (UTC) belongs to a
+separate group `<camera>（タイムゾーン記録あり）`, so an offset saved for the plain camera group (wall clock read
+in the trip zone) never applies to it twice. When the recorded offset equals the trip zone's, both readings give
+the same time and the item stays in the plain group (a clock-drift correction keeps applying after refine).
+A video with a camera label whose time comes from `mvhd` (read as UTC; many cameras write local time there)
+gets its own group `<camera>（動画）`, corrected apart from that camera's photos. Corrections saved by an older
+version as a flat `{ group: minutes }` map are migrated to the folder saved with them.
 
 ### Oracles
 
@@ -415,14 +424,17 @@ is loaded from the global install (`loadPlaywright()`).
 | file | tests |
 |---|---|
 | `01-catalog` | 1 order/times/exclusions/shortcuts/pagination/title & day cards · 1b metadata cache on reload · 3 background EXIF refinement · 3b refinement with a wrong trip zone (requests held with `route`) |
-| `02-playthrough` | 2 full playthrough (sequence, captions, colours, SW Range streaming, HEVC → Drive embed, 2 s video cap, loop) · 2b SW proxy contract · 2c Content-Range hidden by CORS (header-stripping proxy) · **10 [APP BUG]** `serviceWorkers:'block'` · 10a/10b no Service Worker API (direct URL / blob) |
-| `03-grid-refresh-controls` | 4 Canon −6 h correction via the grid, persisted · 5 manual refresh · **5c [APP BUG]** current photo deleted → next item skipped · 5b automatic refresh (`?refresh=0.05`) · 6 keyboard + HUD controls |
-| `04-errors-reskey-share` | 7a start-up errors · 7b form validation + URL forms · **7b2 [APP BUG]** invalid time zone accepted silently · 7c broken photo skipped · 7d thumbnail fallback · 8 resource keys · 15 share link |
-| `05-oauth` | 9a OAuth start · 9b token expiry → overlay → re-login · 9c folder search / login status · 9d HEVC fallback in OAuth · 9e expiring banner · 9f login denied/cancelled · **9g [APP BUG]** two tabs with different credentials |
-| `06-media-mobile` | 11 HEIC via heic-to (skipped when jsDelivr is unreachable) · 11c HEIC without CDN → thumbnail · 11b fast (thumbnail) quality · 12 EXIF orientation · 13 mobile 390×844 + swipe · 16 loop=0 end card · 17 cancel loading · 18 sound after a click / muted autostart |
+| `02-playthrough` | 2 full playthrough (sequence, captions, colours, SW Range streaming, HEVC → Drive embed, 2 s video cap, loop) · 2b SW proxy contract · 2c Content-Range hidden by CORS (header-stripping proxy) · 10 `serviceWorkers:'block'` (the SW never activates → the app times out and plays without it) · 10a/10b no Service Worker API (direct URL / blob) |
+| `03-grid-refresh-controls` | 4 Canon −6 h correction via the grid, persisted per folder · 5 manual refresh · 5c current photo deleted → the next item is not skipped · 5b automatic refresh (`?refresh=0.05`) · 6 keyboard + HUD controls |
+| `04-errors-reskey-share` | 7a start-up errors · 7b form validation + URL forms · 7b2 invalid time zone rejected · 7c broken photo skipped · 7d thumbnail fallback after the SW's retries (4 × 503) · 8 resource keys · 15 share link |
+| `05-oauth` | 9a OAuth start · 9b token expiry → overlay → re-login · 9c folder search / login status · 9d HEVC fallback in OAuth · 9e expiring banner · 9f login denied/cancelled · 9g two tabs with different credentials (per-tab credentials in the SW, checked with an `<img>` through the SW) |
+| `06-media-mobile` | 11 HEIC via heic-to (vendored in `js/vendor/`, CDN hosts blocked to prove no network is needed) · 11c `js/vendor/heic-to.js` blocked → thumbnail · 11b fast (thumbnail) quality · 12 EXIF orientation · 13 mobile 390×844 + swipe · 16 loop=0 end card · 17 cancel loading · 18 sound after a click / muted autostart |
 | `07-big-folder` | 14 `folder_big` (120 photos, pages of 50), grid with 120 tiles |
 | `08-settings` | 19 display settings from the form, persisted; sub-folder switch; full screen |
 | `09-private-thumbnails` | 20 thumbnails needing auth (`thumbAuth: 'required'`): show unaffected, grid fallback tiles |
+| `10-fixes` | regression tests of review findings: F5 SW ignores navigations / iframes, `nosniff` + CSP + safe Content-Type · F10 a single 503 on a photo download is retried → original shown · F10b/F24 an aborted photo download makes no further upstream requests (photo originals are fetched by the page, not the SW; the SW does not retry page `fetch()`) · F6 unreadable folder-shortcut target skipped (toast), show plays · F7/F14 a refresh held across a folder switch does not overwrite the new show · F1 corrections per folder + `fix=` in the share link · F0 corrections do not apply to `（タイムゾーン記録あり）` groups (an offset equal to the trip zone keeps the plain group) · F17 キャンセル during the SW wait · F19 Escape / G close the grid after focus left it · F13b a pause from outside the app pauses the show (no forced mute, no skip) · F18b 「次へ」 with audio locked keeps the outgoing video muted |
 
 Tests whose title starts with **`[APP BUG]`** reproduce a defect of the app and fail until it is
 fixed (the assertion message names the suspected code). Keep them failing rather than weakening them.
+There are none at the moment: the former ones (02 › 10, 03 › 5c, 04 › 7b2, 05 › 9g) pass and are now
+ordinary regression tests. No test needs network access beyond the local servers.

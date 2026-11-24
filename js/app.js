@@ -1,11 +1,11 @@
 // アプリ本体: 設定画面 → フォルダの読み込み → 撮影日時の解析 → スライドショー
 
 import { $, $$, h, icon, toast } from './dom.js';
-import { loadSettings, saveSettings, sanitize, buildShareUrl, resolveApiBase, DEFAULTS } from './settings.js';
+import { loadSettings, saveSettings, sanitize, buildShareUrl, resolveApiBase, DEFAULTS, offsetsForFolder, withFolderOffsets } from './settings.js';
 import { OAuthSession, AuthError } from './auth.js';
 import { DriveClient, DriveError, AuthRequiredError, parseFolderInput } from './drive.js';
 import { extractAll, readCached } from './extract.js';
-import { buildCatalog, summarizeGroups, buildSlides, TIME_SOURCE_LABELS } from './catalog.js';
+import { buildCatalog, summarizeGroups, buildSlides, TIME_SOURCE_LABELS, ZONED_GROUP_SUFFIX, MVHD_VIDEO_GROUP_SUFFIX } from './catalog.js';
 import { MediaLoader, setupServiceWorker } from './loader.js';
 import { Player } from './player.js';
 import { formatDateJa, formatTimeJa, formatDateTimeJa, isValidTimeZone, tzOffsetMs, formatOffset } from './timeutil.js';
@@ -28,10 +28,16 @@ const state = {
   items: [],
   loadAbort: null,
   refineAbort: null,
+  refreshAbort: null,
   refreshTimer: null,
   refreshing: false,
   screen: 'setup',
 };
+
+/** start() / backToSetup() のたびに増える。古い読み込み・更新・解析が新しい状態に書き込まないようにする */
+let sessionGen = 0;
+/** トークンの残りがこれより短ければ、開始・フォルダ検索の前にログインし直す */
+const MIN_TOKEN_MS = 5 * 60000;
 
 // ---------------------------------------------------------------------------
 // 画面切り替え
@@ -114,16 +120,12 @@ function fillTimeZones() {
 // ログイン（OAuth）
 
 function ensureSession(clientId) {
-  if (!clientId) {
-    state.session = null;
-    return null;
-  }
-  if (state.session && state.session.clientId === clientId) return state.session;
+  if (state.session && clientId && state.session.clientId === clientId) return state.session;
+  disposeSession(state.session);
+  state.session = null;
+  if (!clientId) return null;
   const session = new OAuthSession(clientId);
-  session.addEventListener('change', () => {
-    updateLoginStatus();
-    pushCreds();
-  });
+  session.addEventListener('change', onSessionChange);
   session.addEventListener('expiring', onTokenExpiring);
   session.addEventListener('expired', onTokenExpired);
   state.session = session;
@@ -132,6 +134,29 @@ function ensureSession(clientId) {
     if (state.screen === 'setup') updateLoginStatus(e.message);
   });
   return session;
+}
+
+/** 使わなくなったセッションのイベントとタイマーを止める */
+function disposeSession(session) {
+  if (!session) return;
+  session.removeEventListener('change', onSessionChange);
+  session.removeEventListener('expiring', onTokenExpiring);
+  session.removeEventListener('expired', onTokenExpired);
+  session.dispose?.();
+}
+
+/** 今のスライドショーが OAuth でこのセッションを使っているか */
+function isPlayerSession(session) {
+  return !!session && session === state.session && state.drive?.mode === 'oauth';
+}
+
+function onSessionChange(e) {
+  const session = e.target;
+  if (session !== state.session) return;
+  // 十分に長いトークンになったら「まもなく期限切れ」の表示は不要
+  if (session.isValidFor(MIN_TOKEN_MS)) removeExpiringBanner();
+  updateLoginStatus();
+  pushCreds();
 }
 
 function updateLoginStatus(errorMsg) {
@@ -169,51 +194,80 @@ async function signIn() {
 }
 
 let expiringToast = null;
-function onTokenExpiring() {
-  if (state.screen !== 'player') return;
+function removeExpiringBanner() {
   expiringToast?.remove();
-  expiringToast = h('div', { class: 'expiring-banner' }, [
+  expiringToast = null;
+}
+
+function onTokenExpiring(e) {
+  const session = e.target;
+  if (state.screen !== 'player' || !isPlayerSession(session)) return;
+  removeExpiringBanner();
+  const banner = h('div', { class: 'expiring-banner' }, [
     h('span', {}, ['まもなくログインの有効期限が切れます。']),
     h('button', {
       type: 'button',
       class: 'btn btn-light btn-sm',
       onclick: async () => {
         try {
-          await state.session.request({ prompt: '' });
-          expiringToast?.remove();
+          await session.request({ prompt: '' });
+          if (expiringToast === banner) removeExpiringBanner();
           toast('ログインを延長しました');
-        } catch (e) {
-          toast(e.message, { kind: 'warn' });
+        } catch (err) {
+          toast(err.message, { kind: 'warn' });
         }
       },
     }, ['延長する']),
-    h('button', { type: 'button', class: 'ctl', 'aria-label': '閉じる', onclick: () => expiringToast?.remove() }, [icon('close')]),
+    h('button', { type: 'button', class: 'ctl', 'aria-label': '閉じる', onclick: () => expiringToast === banner && removeExpiringBanner() }, [icon('close')]),
   ]);
-  $('#player').append(expiringToast);
+  expiringToast = banner;
+  $('#player').append(banner);
 }
 
-function onTokenExpired() {
-  expiringToast?.remove();
+function onTokenExpired(e) {
+  const session = e.target;
+  if (session !== state.session) return;
   if (state.screen === 'player') {
+    if (!isPlayerSession(session)) return;
+    removeExpiringBanner();
+    const wasPlaying = !!state.player?.playing;
     state.player?.pause();
-    showAuthOverlay();
+    showAuthOverlay(wasPlaying);
   } else if (state.screen === 'setup') {
+    removeExpiringBanner();
     updateLoginStatus();
   }
 }
 
-function showAuthOverlay() {
+/** 再ログイン後に再生を続けるか（オーバーレイを開いたときに再生中だったか） */
+let authWasPlaying = false;
+
+/** 再ログインの画面を出す。wasPlaying: 出す直前まで再生中だったか */
+function showAuthOverlay(wasPlaying = false) {
+  const overlay = $('#auth-overlay');
+  if (overlay.hidden) authWasPlaying = !!wasPlaying;
+  // 期限切れのトークンを Service Worker からも消す（再ログイン直後の動画が古いトークンで 401 にならないように）
+  pushCreds();
   $('#auth-error').textContent = '';
-  $('#auth-overlay').hidden = false;
+  overlay.hidden = false;
   $('#btn-reauth').focus();
 }
 
 $('#btn-reauth').addEventListener('click', async () => {
+  const session = state.session;
+  if (!session || state.drive?.mode !== 'oauth') {
+    $('#auth-overlay').hidden = true;
+    return;
+  }
   try {
-    await state.session.request({ prompt: '' });
+    if (!session.client) await session.init();
+    await session.request({ prompt: '' });
+    if (session !== state.session || state.screen !== 'player') return;
     $('#auth-overlay').hidden = true;
     pushCreds();
-    state.player?.play();
+    // 一覧が開いているときや一時停止中だったときは再生を始めない（一覧を閉じたときに決める）
+    if (authWasPlaying && $('#grid-overlay').hidden) state.player?.play();
+    authWasPlaying = false;
     state.player?.retry();
   } catch (e) {
     $('#auth-error').textContent = e.message;
@@ -244,17 +298,20 @@ function pushCreds() {
   if (!state.sw || !state.drive) return;
   state.drive.credentials(false).then(
     (c) => state.sw && state.sw.pushCreds(c),
-    () => {},
+    // 使えるトークンがなければ、このタブの古い接続情報を Service Worker から消す
+    () => state.sw && state.sw.pushCreds(null),
   );
 }
 
 function ensureServiceWorker() {
   if (!state.swPromise) {
-    state.swPromise = setupServiceWorker({ getCreds }).then((sw) => {
-      state.sw = sw;
-      if (!sw) console.info('Service Worker を使わずに再生します（動画は全体をダウンロードしてから再生）');
-      return sw;
-    });
+    state.swPromise = setupServiceWorker({ getCreds })
+      .catch(() => null)
+      .then((sw) => {
+        state.sw = sw || null;
+        if (!sw) console.info('Service Worker を使わずに再生します（動画は全体をダウンロードしてから再生）');
+        return state.sw;
+      });
   }
   return state.swPromise;
 }
@@ -270,29 +327,34 @@ function setLoading(title, detail = '', frac = null) {
   bar.parentElement.classList.toggle('indeterminate', frac == null);
 }
 
+function timeZoneError(tz) {
+  return isValidTimeZone(tz) ? null : `タイムゾーン「${tz}」が正しくありません（例：Europe/Helsinki）。`;
+}
+
 function validate(s) {
   if (!s.folder) return 'フォルダの URL または ID を入力してください。';
   if (!parseFolderInput(s.folder)) return 'フォルダの URL の形式が正しくありません。ドライブでフォルダを開いたときの URL を貼り付けてください。';
   if (s.authMode === 'apikey' && !s.apiKey) return 'API キーを入力してください。';
   if (s.authMode === 'oauth' && !s.clientId) return 'OAuth クライアント ID を入力してください（「OAuth クライアント ID」の欄）。';
-  if (!isValidTimeZone(s.timeZone)) return `タイムゾーン「${s.timeZone}」が正しくありません（例：Europe/Helsinki）。`;
-  return null;
+  return timeZoneError(s.timeZone);
 }
 
 form.addEventListener('submit', async (e) => {
   e.preventDefault();
   setupError(null);
-  const s = sanitize(readForm());
-  const err = validate(s);
+  // sanitize は不正な値を既定値に戻すので、入力そのものを先に検証する
+  const raw = readForm();
+  const err = validate(raw);
   if (err) {
     setupError(err);
     return;
   }
+  const s = sanitize(raw);
   state.settings = s;
   saveSettings(s);
   if (s.authMode === 'oauth') {
     const session = ensureSession(s.clientId);
-    if (!session.signedIn) {
+    if (!session.isValidFor(MIN_TOKEN_MS)) {
       try {
         // クリック直後に呼ぶ（ポップアップブロック回避）
         if (!session.client) await session.init();
@@ -313,12 +375,19 @@ form.addEventListener('change', (e) => {
 form.clientId.addEventListener('input', () => updateLoginStatus());
 
 $('#btn-share').addEventListener('click', async () => {
-  const s = sanitize(readForm());
-  if (!s.folder) {
+  setupError(null);
+  const raw = readForm();
+  if (!raw.folder) {
     setupError('先にフォルダの URL を入力してください。');
     return;
   }
-  const url = buildShareUrl(location.href, s);
+  // sanitize は不正なタイムゾーンを既定値に戻してしまうので、リンクを作る前に入力そのものを確かめる
+  const err = parseFolderInput(raw.folder) ? timeZoneError(raw.timeZone) : validate(raw);
+  if (err) {
+    setupError(err);
+    return;
+  }
+  const url = buildShareUrl(location.href, sanitize(raw));
   try {
     await navigator.clipboard.writeText(url);
     toast('共有用リンクをコピーしました');
@@ -329,8 +398,18 @@ $('#btn-share').addEventListener('click', async () => {
 
 $('#btn-cancel-load').addEventListener('click', () => {
   state.loadAbort?.abort();
+  state.loadAbort = null;
   showScreen('setup');
 });
+
+/** 進行中の自動更新・精密解析を止め、古い処理の結果が使われないようにする */
+function endSession() {
+  sessionGen++;
+  stopRefreshTimer();
+  cancelRefresh();
+  state.refineAbort?.abort();
+  state.refineAbort = null;
+}
 
 async function start() {
   const s = state.settings;
@@ -339,8 +418,8 @@ async function start() {
   state.loadAbort?.abort();
   const abort = new AbortController();
   state.loadAbort = abort;
-  stopRefreshTimer();
-  state.refineAbort?.abort();
+  endSession();
+  const stale = () => abort.signal.aborted || state.loadAbort !== abort;
   try {
     state.drive = makeDrive(s);
     const folder = parseFolderInput(s.folder);
@@ -351,7 +430,7 @@ async function start() {
       signal: abort.signal,
       onProgress: ({ folders, files }) => setLoading('フォルダを読み込み中…', `${folders} フォルダ・写真と動画 ${files} 件`),
     });
-    if (abort.signal.aborted) return;
+    if (stale()) return;
     state.root = listing.root;
     state.files = listing.files;
     if (!state.files.length) {
@@ -365,17 +444,21 @@ async function start() {
       signal: abort.signal,
       onProgress: (done, total) => total && setLoading('撮影日時を確認中…', `${done} / ${total}（動画など）`, done / total),
     });
-    if (abort.signal.aborted) return;
+    if (stale()) return;
     // 以前に精密解析した結果があれば最初から使う（残りは再生しながら裏で解析）
     state.extracted = s.preciseTimes ? new Map([...readCached(state.files, ['refine']), ...required]) : required;
+    // Service Worker が使えなければ null（使わずに再生する）
     await swP;
+    // 待っている間にキャンセル・別の開始があった
+    if (stale()) return;
     pushCreds();
     rebuildCatalog();
     startPlayer();
     startRefreshTimer();
     refineInBackground();
+    if (listing.skippedFolders) toast(`アクセスできないフォルダを ${listing.skippedFolders} 件スキップしました`, { kind: 'warn' });
   } catch (e) {
-    if (abort.signal.aborted) return;
+    if (stale()) return;
     console.error(e);
     showScreen('setup');
     if (e instanceof AuthRequiredError) {
@@ -390,22 +473,30 @@ async function start() {
 /** 写真の EXIF をファイルから直接読み、撮影時刻をより正確にする（再生を止めずに裏で実行） */
 async function refineInBackground() {
   state.refineAbort?.abort();
-  if (!state.settings.preciseTimes || !state.drive) return;
+  if (!state.settings.preciseTimes || !state.drive || !state.root) return;
   const abort = new AbortController();
   state.refineAbort = abort;
   const drive = state.drive;
+  const rootId = state.root.id;
+  const gen = sessionGen;
   const files = state.files;
+  // 別のフォルダ・設定画面に移ったあとは何も書き込まない
+  const stale = () => abort.signal.aborted || gen !== sessionGen || state.drive !== drive || state.root?.id !== rootId;
   let pending = 0;
+  const timesSig = () => state.items.map((i) => `${i.id}@${i.epoch}`).join('\n');
+  const groupsSig = () => state.items.map((i) => i.group).join('\n');
   const apply = () => {
-    if (!pending || abort.signal.aborted) return;
+    if (!pending || stale()) return;
     pending = 0;
-    const before = state.items.map((i) => `${i.id}@${i.epoch}`).join();
+    const beforeTimes = timesSig();
+    const beforeGroups = groupsSig();
     rebuildCatalog();
-    const after = state.items.map((i) => `${i.id}@${i.epoch}`).join();
-    if (before !== after) {
-      state.player?.setItems(state.items);
-      if (!$('#grid-overlay').hidden) renderGrid();
-    }
+    const timesChanged = beforeTimes !== timesSig();
+    if (timesChanged) state.player?.setItems(state.items);
+    if ($('#grid-overlay').hidden) return;
+    // 一覧は時刻・順番が変わったときだけ作り直す。補正の表はグループが変わったときも作り直す
+    if (timesChanged) renderGrid();
+    if (timesChanged || beforeGroups !== groupsSig()) renderTimeFix({ keepEdits: true });
   };
   try {
     await extractAll(drive, files, {
@@ -413,7 +504,7 @@ async function refineInBackground() {
       signal: abort.signal,
       concurrency: 3,
       onResult: (id, data) => {
-        if (abort.signal.aborted || state.drive !== drive) return;
+        if (stale()) return;
         if (data) {
           state.extracted.set(id, data);
           pending++;
@@ -422,14 +513,19 @@ async function refineInBackground() {
       },
     });
   } catch (e) {
-    if (!abort.signal.aborted) console.info('撮影日時の精密解析を中断しました:', e && e.message);
+    if (!stale()) console.info('撮影日時の精密解析を中断しました:', e && e.message);
   }
-  if (state.drive === drive) apply();
+  if (!stale()) apply();
+}
+
+/** 時刻補正を保存するキー（設定のフォルダ ID。共有リンクの fix= と同じ） */
+function currentFolderId() {
+  return parseFolderInput(state.settings.folder)?.id || state.root?.id || '';
 }
 
 function rebuildCatalog() {
   const s = state.settings;
-  state.items = buildCatalog(state.files, state.extracted, { timeZone: s.timeZone, cameraOffsets: s.cameraOffsets });
+  state.items = buildCatalog(state.files, state.extracted, { timeZone: s.timeZone, cameraOffsets: offsetsForFolder(s, currentFolderId()) });
 }
 
 function title() {
@@ -446,7 +542,10 @@ function startPlayer() {
       loader: state.loader,
       getSettings: () => state.settings,
       getTitle: title,
-      onAuthRequired: () => showAuthOverlay(),
+      // info.wasPlaying: 止める直前に再生中だったか（渡されなければ再生中だったとみなす）
+      onAuthRequired: (err, info) => {
+        if (state.drive?.mode === 'oauth') showAuthOverlay(info?.wasPlaying ?? true);
+      },
       onOpenGrid: () => openGrid(),
       onOpenSettings: () => backToSetup(),
     });
@@ -461,10 +560,13 @@ function startPlayer() {
 }
 
 function backToSetup() {
-  stopRefreshTimer();
-  state.refineAbort?.abort();
+  state.loadAbort?.abort();
+  state.loadAbort = null;
+  endSession();
   state.player?.stop();
-  $('#grid-overlay').hidden = true;
+  removeExpiringBanner();
+  $('#auth-overlay').hidden = true;
+  hideGrid();
   if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
   fillForm(state.settings);
   showScreen('setup');
@@ -492,11 +594,32 @@ function fileKey(f) {
   return `${f.id}|${f.modifiedTime || ''}|${f.md5Checksum || ''}`;
 }
 
+let refreshGen = 0;
+
+/** 進行中の更新を中止する（結果は捨てる） */
+function cancelRefresh() {
+  refreshGen++;
+  state.refreshAbort?.abort();
+  state.refreshAbort = null;
+  state.refreshing = false;
+}
+
 async function refresh({ silent = false } = {}) {
   if (state.refreshing || !state.drive || !state.root) return;
   state.refreshing = true;
+  const gen = ++refreshGen;
+  const sGen = sessionGen;
+  const abort = new AbortController();
+  state.refreshAbort = abort;
+  const drive = state.drive;
+  const rootId = state.root.id;
+  // 別のフォルダを開いた・設定画面に戻ったなどで、この更新の結果はもう使わない
+  const stale = () => abort.signal.aborted || gen !== refreshGen || sGen !== sessionGen || state.drive !== drive || state.root?.id !== rootId;
   try {
-    const listing = await state.drive.listMediaTree(state.root.id, { recursive: state.settings.includeSubfolders });
+    const listing = await drive.listMediaTree(rootId, { recursive: state.settings.includeSubfolders, signal: abort.signal });
+    if (stale()) return;
+    const required = await extractAll(drive, listing.files, { phases: ['required'], signal: abort.signal });
+    if (stale()) return;
     const before = new Set(state.files.map(fileKey));
     const after = new Set(listing.files.map(fileKey));
     const beforeIds = new Set(state.files.map((f) => f.id));
@@ -504,7 +627,6 @@ async function refresh({ silent = false } = {}) {
     const added = listing.files.filter((f) => !beforeIds.has(f.id)).length;
     const removed = state.files.filter((f) => !afterIds.has(f.id)).length;
     const changed = [...after].some((k) => !before.has(k)) || removed > 0;
-    const required = await extractAll(state.drive, listing.files, { phases: ['required'] });
     const extracted = new Map(state.extracted);
     for (const [id, v] of required) extracted.set(id, v);
     if (state.settings.preciseTimes) for (const [id, v] of readCached(listing.files, ['refine'])) extracted.set(id, v);
@@ -514,7 +636,11 @@ async function refresh({ silent = false } = {}) {
     state.root = listing.root;
     rebuildCatalog();
     state.player?.setItems(state.items);
-    if (!$('#grid-overlay').hidden) renderGrid();
+    if (!$('#grid-overlay').hidden) {
+      renderGrid();
+      renderTimeFix({ keepEdits: true });
+    }
+    if (!silent && listing.skippedFolders) toast(`アクセスできないフォルダを ${listing.skippedFolders} 件スキップしました`, { kind: 'warn' });
     if (!changed) {
       if (!silent) toast('新しい写真・動画はありませんでした');
       return;
@@ -525,15 +651,20 @@ async function refresh({ silent = false } = {}) {
     toast(msgs.length ? `フォルダが更新されました（${msgs.join('・')}）` : 'フォルダの内容が更新されました');
     refineInBackground();
   } catch (e) {
+    if (stale()) return;
     console.warn('自動更新に失敗:', e);
     if (e instanceof AuthRequiredError) {
-      if (state.screen === 'player') {
+      if (state.screen === 'player' && state.drive?.mode === 'oauth') {
+        const wasPlaying = !!state.player?.playing;
         state.player?.pause();
-        showAuthOverlay();
+        showAuthOverlay(wasPlaying);
       }
     } else if (!silent) toast(e.message || '更新に失敗しました', { kind: 'warn' });
   } finally {
-    state.refreshing = false;
+    if (gen === refreshGen) {
+      state.refreshing = false;
+      state.refreshAbort = null;
+    }
   }
 }
 
@@ -550,23 +681,38 @@ function openGrid() {
   state.player?.pause();
   renderGrid();
   renderTimeFix();
-  $('#grid-overlay').hidden = false;
+  const overlay = $('#grid-overlay');
+  overlay.hidden = false;
+  // 一覧の後ろのスライドショーにはフォーカスもクリックも届かないようにする
+  $('#player').inert = true;
+  overlay.focus({ preventScroll: true });
   const cur = state.player?.currentItem;
   const tile = cur && $(`#grid-body [data-id="${CSS.escape(cur.id)}"]`);
   if (tile) {
     tile.scrollIntoView({ block: 'center' });
     tile.focus({ preventScroll: true });
-  } else $('#btn-grid-close').focus();
+  }
+}
+
+/** 一覧を閉じるだけ（再生はしない） */
+function hideGrid() {
+  $('#grid-overlay').hidden = true;
+  $('#player').inert = false;
 }
 
 function closeGrid({ resume = gridWasPlaying } = {}) {
-  $('#grid-overlay').hidden = true;
+  if ($('#grid-overlay').hidden) return;
+  hideGrid();
   if (resume) state.player?.play();
 }
 
 $('#btn-grid-close').addEventListener('click', () => closeGrid());
-$('#grid-overlay').addEventListener('keydown', (e) => {
-  if (e.key === 'Escape') {
+// 一覧の外にフォーカスがあっても（余白のクリック、再描画のあとなど）Escape / G で閉じる
+document.addEventListener('keydown', (e) => {
+  if ($('#grid-overlay').hidden || !$('#auth-overlay').hidden) return;
+  if (e.defaultPrevented || e.altKey || e.ctrlKey || e.metaKey || e.isComposing) return;
+  const inField = !!e.target?.closest?.('input, textarea, select, [contenteditable="true"]');
+  if (e.key === 'Escape' || ((e.key === 'g' || e.key === 'G') && !inField)) {
     e.preventDefault();
     closeGrid();
   }
@@ -627,6 +773,9 @@ function formatDuration(ms) {
 function renderGrid() {
   const s = state.settings;
   const body = $('#grid-body');
+  // 作り直したあとも同じタイルにフォーカスを戻す
+  const active = document.activeElement;
+  const focusedId = active && body.contains(active) ? active.dataset.id : null;
   const slides = buildSlides(state.items, { showTitleCard: false, showDayCards: true });
   $('#grid-title').textContent = `${title()}（${state.items.length}件）`;
   const frag = document.createDocumentFragment();
@@ -638,7 +787,13 @@ function renderGrid() {
       section = h('div', { class: 'grid-tiles' });
       frag.append(
         h('section', { class: 'grid-day' }, [
-          h('h3', {}, [h('span', { class: 'day-num' }, [`${sl.dayNumber}日目`]), ' ', first ? formatDateJa(first.epoch, s.timeZone) : sl.day, h('span', { class: 'muted' }, [` ${sl.count}件`])]),
+          h('h3', {}, [
+            // 主な期間の外の日（dayNumber が null）は日付だけ
+            sl.dayNumber != null ? h('span', { class: 'day-num' }, [`${sl.dayNumber}日目`]) : null,
+            sl.dayNumber != null ? ' ' : null,
+            first ? formatDateJa(first.epoch, s.timeZone) : sl.day,
+            h('span', { class: 'muted' }, [` ${sl.count}件`]),
+          ]),
           section,
         ]),
       );
@@ -655,8 +810,10 @@ function renderGrid() {
         dataset: { id: it.id },
         title: `${it.name}\n${formatDateTimeJa(it.epoch, s.timeZone, { withYear: true })}\n${TIME_SOURCE_LABELS[it.timeSource] || ''}${it.offsetMinutes ? `（補正 ${it.offsetMinutes > 0 ? '+' : ''}${it.offsetMinutes}分）` : ''}`,
         onclick: () => {
-          closeGrid({ resume: true });
-          state.player?.goToItem(it.id);
+          // 今のスライド（動画）を再開せずに、選んだ項目から再生する
+          const wasPlaying = gridWasPlaying;
+          closeGrid({ resume: false });
+          if (!state.player?.goToItem(it.id, { play: true }) && wasPlaying) state.player?.play();
         },
       },
       [
@@ -693,13 +850,33 @@ function renderGrid() {
     (section || frag).append(tile);
   }
   body.replaceChildren(frag);
+  if (focusedId) {
+    const again = $(`#grid-body .tile[data-id="${CSS.escape(focusedId)}"]`);
+    if (again) again.focus({ preventScroll: true });
+    else if (!$('#grid-overlay').hidden) $('#grid-overlay').focus({ preventScroll: true });
+  }
 }
 
-function renderTimeFix() {
+/**
+ * カメラ別の時刻補正の表。keepEdits: 入力途中の値とフォーカスを残す（裏で一覧が変わったとき）
+ */
+function renderTimeFix({ keepEdits = false } = {}) {
   const s = state.settings;
+  const table = $('#time-fix-table');
+  const edits = new Map();
+  let focus = null;
+  if (keepEdits) {
+    for (const row of $$('.fix-row', table)) {
+      const inputs = $$('input', row);
+      if (inputs.some((i) => i.value !== i.defaultValue)) edits.set(row.dataset.group, inputs.map((i) => i.value));
+      const k = inputs.indexOf(document.activeElement);
+      if (k >= 0) focus = { group: row.dataset.group, k };
+    }
+  }
+  const saved = offsetsForFolder(s, currentFolderId());
   const groups = summarizeGroups(state.items);
   const rows = groups.map((g) => {
-    const off = Number(s.cameraOffsets[g.group]) || 0;
+    const off = (Object.prototype.hasOwnProperty.call(saved, g.group) && Number(saved[g.group])) || 0;
     const sign = off < 0 ? -1 : 1;
     const hh = h('input', { type: 'number', min: '-48', max: '48', step: '1', value: String(sign * Math.floor(Math.abs(off) / 60)), 'aria-label': `${g.group} の補正（時間）`, class: 'num-sm' });
     const mm = h('input', { type: 'number', min: '-59', max: '59', step: '1', value: String(sign * (Math.abs(off) % 60)), 'aria-label': `${g.group} の補正（分）`, class: 'num-sm' });
@@ -710,10 +887,21 @@ function renderTimeFix() {
     ]);
   });
   const off = tzOffsetMs(state.items[0]?.epoch || Date.now(), s.timeZone);
-  $('#time-fix-table').replaceChildren(
-    h('p', { class: 'muted small' }, [`撮影地のタイムゾーン: ${s.timeZone}（${formatOffset(off)}）`]),
+  const zoned = groups.some((g) => g.group.endsWith(ZONED_GROUP_SUFFIX));
+  const mvhd = groups.some((g) => g.group.endsWith(MVHD_VIDEO_GROUP_SUFFIX));
+  const note = (text) => h('p', { class: 'muted small' }, [text]);
+  table.replaceChildren(
+    note(`撮影地のタイムゾーン: ${s.timeZone}（${formatOffset(off)}）`),
+    ...(zoned ? [note(`「${ZONED_GROUP_SUFFIX}」のグループは撮影時のタイムゾーンがファイルに記録されているため、通常は補正の必要はありません。`)] : []),
+    ...(mvhd ? [note(`「${MVHD_VIDEO_GROUP_SUFFIX}」のグループは動画ファイルの作成日時を UTC として読んでいます。カメラが現地時刻で記録している場合は、写真とは別にここで補正してください。`)] : []),
     ...rows,
   );
+  for (const row of rows) {
+    const inputs = $$('input', row);
+    const vals = edits.get(row.dataset.group);
+    if (vals) inputs.forEach((i, k) => (i.value = vals[k] ?? i.value));
+    if (focus && focus.group === row.dataset.group) inputs[focus.k]?.focus({ preventScroll: true });
+  }
 }
 
 $('#btn-time-fix-apply').addEventListener('click', () => {
@@ -723,7 +911,7 @@ $('#btn-time-fix-apply').addEventListener('click', () => {
     const total = Math.round(hh * 60 + mm);
     if (total) offsets[row.dataset.group] = total;
   }
-  state.settings = sanitize({ ...state.settings, cameraOffsets: offsets });
+  state.settings = sanitize(withFolderOffsets(state.settings, currentFolderId(), offsets));
   saveSettings(state.settings);
   rebuildCatalog();
   state.player?.setItems(state.items);
@@ -743,7 +931,7 @@ $('#btn-folder-search').addEventListener('click', async () => {
     return;
   }
   const session = ensureSession(s.clientId);
-  if (!session.signedIn) {
+  if (!session.isValidFor(MIN_TOKEN_MS)) {
     try {
       if (!session.client) await session.init();
       await session.request({ prompt: '' });
@@ -758,11 +946,14 @@ $('#btn-folder-search').addEventListener('click', async () => {
   searchFolders('');
 });
 
+let folderSearchSeq = 0;
 async function searchFolders(q) {
   const ul = $('#folder-results');
+  const seq = ++folderSearchSeq;
   ul.replaceChildren(h('li', { class: 'muted' }, ['検索中…']));
   try {
     const folders = await state.drive.searchFolders(q);
+    if (seq !== folderSearchSeq) return; // 新しい検索の結果を優先
     if (!folders.length) {
       ul.replaceChildren(h('li', { class: 'muted' }, ['見つかりませんでした']));
       return;
@@ -783,7 +974,7 @@ async function searchFolders(q) {
       ),
     );
   } catch (e) {
-    ul.replaceChildren(h('li', { class: 'error-text' }, [e.message]));
+    if (seq === folderSearchSeq) ul.replaceChildren(h('li', { class: 'error-text' }, [e.message]));
   }
 }
 
@@ -803,6 +994,14 @@ function init() {
   fillTimeZones();
   fillForm(state.settings);
   showScreen('setup');
+  // URL の tz= が正しくなければ（既定値に戻さず）入力欄に残して知らせる。自動開始もしない
+  const urlTz = (params.get('tz') || '').trim();
+  const tzErr = urlTz ? timeZoneError(urlTz) : null;
+  if (tzErr) {
+    form.timeZone.value = urlTz;
+    setupError(tzErr);
+    return;
+  }
   // ?autostart=1 で設定が揃っていればすぐに開始（API キー、またはログイン済みの場合）
   if (params.get('autostart') === '1' && !validate(state.settings)) {
     if (state.settings.authMode === 'apikey' || ensureSession(state.settings.clientId)?.signedIn) {
