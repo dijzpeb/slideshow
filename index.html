@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#0b1020" />
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
+    <title>旅の写真スライドショー</title>
+    <meta name="description" content="Google ドライブのフォルダに置いた旅行の写真・動画を、撮影日時の順にスライドショーで再生します。" />
+    <link rel="icon" href="icons/favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="css/style.css" />
+    <script src="config.js"></script>
+    <script type="module" src="js/app.js"></script>
+  </head>
+  <body>
+    <noscript><p class="noscript">このアプリを使うには JavaScript を有効にしてください。</p></noscript>
+
+    <!-- 設定画面 -->
+    <main id="setup" class="screen setup" hidden>
+      <header class="setup-header">
+        <div class="brand">
+          <img src="icons/favicon.svg" alt="" width="40" height="40" />
+          <div>
+            <h1>旅の写真スライドショー</h1>
+            <p class="lead">Google ドライブのフォルダに写真や動画を入れるだけで、撮影した順にスライドショーにします。</p>
+          </div>
+        </div>
+      </header>
+
+      <form id="setup-form" class="card-panel" novalidate autocomplete="off">
+        <section class="field-group">
+          <h2>1. 写真・動画のフォルダ</h2>
+          <label class="field">
+            <span class="label">Google ドライブのフォルダの URL（または ID）</span>
+            <div class="input-row">
+              <input id="f-folder" name="folder" type="text" inputmode="url" spellcheck="false"
+                placeholder="https://drive.google.com/drive/folders/..." required />
+              <button id="btn-folder-search" type="button" class="btn btn-secondary" data-mode="oauth">フォルダを検索</button>
+            </div>
+            <span class="hint">ドライブでフォルダを開いたときのアドレスバーの URL を貼り付けてください。サブフォルダの中も読み込みます。</span>
+          </label>
+        </section>
+
+        <section class="field-group">
+          <h2>2. ドライブへの接続方法</h2>
+          <div class="radio-cards" role="radiogroup" aria-label="接続方法">
+            <label class="radio-card">
+              <input type="radio" name="authMode" value="oauth" />
+              <span class="radio-title">Google アカウントでログイン</span>
+              <span class="radio-desc">非公開のフォルダでも OK。見る人それぞれがログインします。</span>
+            </label>
+            <label class="radio-card">
+              <input type="radio" name="authMode" value="apikey" />
+              <span class="radio-title">API キー（ログイン不要）</span>
+              <span class="radio-desc">フォルダを「リンクを知っている全員」に共有している場合。テレビ等での連続再生に便利。</span>
+            </label>
+          </div>
+
+          <div class="mode-panel" data-mode="oauth">
+            <div id="login-status" class="login-status" aria-live="polite"></div>
+            <details id="oauth-advanced" class="advanced">
+              <summary>OAuth クライアント ID</summary>
+              <label class="field">
+                <span class="label">OAuth 2.0 クライアント ID（ウェブアプリケーション）</span>
+                <input id="f-clientId" name="clientId" type="text" spellcheck="false"
+                  placeholder="1234567890-xxxx.apps.googleusercontent.com" />
+                <span class="hint">Google Cloud コンソールで作成します。手順は README を参照してください。</span>
+              </label>
+            </details>
+          </div>
+
+          <div class="mode-panel" data-mode="apikey">
+            <label class="field">
+              <span class="label">API キー</span>
+              <input id="f-apiKey" name="apiKey" type="text" spellcheck="false" placeholder="AIza..." />
+              <span class="hint">Google Drive API を有効にしたプロジェクトの API キー。ウェブサイト制限（HTTP リファラー）の設定をおすすめします。</span>
+            </label>
+          </div>
+        </section>
+
+        <section class="field-group">
+          <details class="advanced" id="display-settings">
+            <summary><h2>3. 表示の設定（任意）</h2></summary>
+            <div class="grid-fields">
+              <label class="field">
+                <span class="label">写真の表示時間（秒）</span>
+                <input name="photoSeconds" type="number" min="1" max="120" step="0.5" />
+              </label>
+              <label class="field">
+                <span class="label">動画の最大再生時間（秒、0 = 最後まで）</span>
+                <input name="videoMaxSeconds" type="number" min="0" max="3600" step="1" />
+              </label>
+              <label class="field">
+                <span class="label">切り替え効果</span>
+                <select name="transition">
+                  <option value="fade">フェード</option>
+                  <option value="none">なし</option>
+                </select>
+              </label>
+              <label class="field">
+                <span class="label">キャプション</span>
+                <select name="captions">
+                  <option value="datetime">撮影日時</option>
+                  <option value="datetime-name">撮影日時とファイル名</option>
+                  <option value="none">表示しない</option>
+                </select>
+              </label>
+              <label class="field">
+                <span class="label">撮影地のタイムゾーン</span>
+                <input name="timeZone" type="text" list="tz-list" spellcheck="false" />
+                <datalist id="tz-list"></datalist>
+                <span class="hint">写真の撮影時刻はこのタイムゾーンの現地時刻として扱います（フィンランドは Europe/Helsinki）。</span>
+              </label>
+              <label class="field">
+                <span class="label">フォルダの自動更新（分、0 = しない）</span>
+                <input name="refreshMinutes" type="number" min="0" max="1440" step="1" />
+                <span class="hint">再生中に追加された写真も、撮影日時の位置に自動で入ります。</span>
+              </label>
+              <label class="field">
+                <span class="label">写真の画質</span>
+                <select name="imageQuality">
+                  <option value="original">元の画像（高画質）</option>
+                  <option value="fast">Google の縮小画像（高速・省データ）</option>
+                </select>
+              </label>
+              <label class="field">
+                <span class="label">タイトル（空欄ならフォルダ名）</span>
+                <input name="title" type="text" maxlength="120" placeholder="フィンランド旅行 2025" />
+              </label>
+            </div>
+            <div class="checks">
+              <label class="check"><input type="checkbox" name="kenBurns" /> 写真をゆっくりズーム（ケン・バーンズ効果）</label>
+              <label class="check"><input type="checkbox" name="blurBackground" /> 余白をぼかした写真で埋める</label>
+              <label class="check"><input type="checkbox" name="showTitleCard" /> 最初にタイトルを表示</label>
+              <label class="check"><input type="checkbox" name="showDayCards" /> 日付が変わるところで「○日目」を表示</label>
+              <label class="check"><input type="checkbox" name="videoMuted" /> 動画の音声をミュート</label>
+              <label class="check"><input type="checkbox" name="loop" /> 最後まで再生したら最初に戻る</label>
+              <label class="check"><input type="checkbox" name="includeSubfolders" /> サブフォルダの写真・動画も含める</label>
+              <label class="check"><input type="checkbox" name="preciseTimes" /> 写真の撮影日時をファイルから直接読み取って補正する（より正確。再生しながら裏で処理）</label>
+            </div>
+          </details>
+        </section>
+
+        <div id="setup-error" class="error-box" role="alert" hidden></div>
+
+        <div class="actions">
+          <button id="btn-start" type="submit" class="btn btn-primary btn-lg">スライドショーを開始</button>
+          <button id="btn-share" type="button" class="btn btn-ghost">共有用リンクをコピー</button>
+        </div>
+      </form>
+
+      <details class="help card-panel">
+        <summary>はじめての方へ：準備の手順</summary>
+        <ol>
+          <li>Google ドライブに旅行用のフォルダを作り、写真・動画を入れます（日ごとのサブフォルダに分けても OK）。</li>
+          <li><strong>Google アカウントでログイン</strong>する場合：Google Cloud コンソールで「Google Drive API」を有効にし、OAuth クライアント ID（ウェブアプリケーション、承認済みの JavaScript 生成元にこのページのアドレス）を作成して上の欄に入力します。</li>
+          <li><strong>API キー</strong>を使う場合：フォルダを「リンクを知っている全員（閲覧者）」で共有し、Google Drive API を有効にしたプロジェクトで API キーを作成して入力します。</li>
+          <li>フォルダの URL を貼り付けて「スライドショーを開始」を押します。</li>
+        </ol>
+        <p>写真は撮影日時（EXIF）、動画は動画ファイル内の撮影日時で並べます。見つからない場合はファイル名やドライブ上の日時から推定します。</p>
+        <p>キーボード操作：<kbd>Space</kbd> 再生/一時停止、<kbd>←</kbd><kbd>→</kbd> 前/次、<kbd>F</kbd> 全画面、<kbd>M</kbd> ミュート、<kbd>G</kbd> 一覧</p>
+      </details>
+      <footer class="setup-footer">
+        <span>写真はこのブラウザと Google ドライブの間だけでやり取りされ、他のサーバーには送信されません。</span>
+      </footer>
+    </main>
+
+    <!-- 読み込み中 -->
+    <section id="loading" class="screen loading" hidden aria-live="polite">
+      <div class="loading-box">
+        <div class="spinner on" aria-hidden="true"></div>
+        <p id="loading-title" class="loading-title">読み込み中…</p>
+        <p id="loading-detail" class="loading-detail"></p>
+        <div class="loading-progress" aria-hidden="true"><div id="loading-bar"></div></div>
+        <button id="btn-cancel-load" type="button" class="btn btn-ghost">キャンセル</button>
+      </div>
+    </section>
+
+    <!-- スライドショー -->
+    <section id="player" class="screen player" hidden aria-label="スライドショー"></section>
+
+    <!-- 一覧・時刻補正 -->
+    <div id="grid-overlay" class="overlay grid-overlay" role="dialog" aria-modal="true" aria-labelledby="grid-title" hidden>
+      <div class="overlay-header">
+        <h2 id="grid-title">一覧</h2>
+        <div class="overlay-actions">
+          <button id="btn-refresh" type="button" class="btn btn-ghost btn-sm">今すぐ更新</button>
+          <button id="btn-grid-close" type="button" class="btn btn-secondary btn-sm">スライドショーに戻る</button>
+        </div>
+      </div>
+      <details id="time-fix" class="time-fix">
+        <summary>撮影時刻がずれている？ カメラごとに補正する</summary>
+        <p class="hint">カメラの時計を日本時間のままにしていた場合などは、そのカメラの写真だけ時刻をずらして正しい順番にできます（例：日本時間のままのカメラをフィンランド夏時間に合わせるには −6 時間）。</p>
+        <div id="time-fix-table"></div>
+        <div class="actions"><button id="btn-time-fix-apply" type="button" class="btn btn-primary btn-sm">補正を適用</button></div>
+      </details>
+      <div id="grid-body" class="grid-body"></div>
+    </div>
+
+    <!-- フォルダ検索 -->
+    <div id="folder-overlay" class="overlay folder-overlay" role="dialog" aria-modal="true" aria-labelledby="folder-title" hidden>
+      <div class="dialog">
+        <div class="overlay-header">
+          <h2 id="folder-title">フォルダを検索</h2>
+          <button id="btn-folder-close" type="button" class="ctl" aria-label="閉じる">×</button>
+        </div>
+        <form id="folder-search-form" class="input-row">
+          <input id="folder-query" type="search" placeholder="フォルダ名（例：フィンランド）" />
+          <button type="submit" class="btn btn-secondary">検索</button>
+        </form>
+        <ul id="folder-results" class="folder-results"></ul>
+      </div>
+    </div>
+
+    <!-- 再ログイン -->
+    <div id="auth-overlay" class="overlay auth-overlay" role="dialog" aria-modal="true" aria-labelledby="auth-title" hidden>
+      <div class="dialog">
+        <h2 id="auth-title">ログインの有効期限が切れました</h2>
+        <p>Google のログインは約 1 時間で期限が切れます。続きを再生するには、もう一度ログインしてください。</p>
+        <div class="actions">
+          <button id="btn-reauth" type="button" class="btn btn-primary">ログインして続ける</button>
+          <button id="btn-auth-cancel" type="button" class="btn btn-ghost">設定に戻る</button>
+        </div>
+        <p id="auth-error" class="error-text" role="alert"></p>
+      </div>
+    </div>
+  </body>
+</html>
