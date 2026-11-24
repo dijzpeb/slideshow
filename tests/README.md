@@ -10,6 +10,9 @@ tests/
   e2e/smoke-mock.mjs        smoke test of the mock API (fetch only, no browser)
   e2e/smoke-browser.mjs     smoke test of the mock from real Chromium (CORS, <img>, <video>)
   e2e/blank.html            empty same-origin page used by smoke-browser.mjs
+  e2e/lib.mjs               shared helpers of the Playwright E2E suite (recorder, GIS stub, …)
+  e2e/*.test.mjs            the Playwright E2E suite (section 4)
+  e2e/out/                  screenshots written by the suite (git-ignored)
 ```
 
 ## Quick start
@@ -371,3 +374,55 @@ await browser.close(); await env.close();
 * EXIF orientation is applied by `<img>`/`createImageBitmap` (cathedral shows as 853×1280).
 
 `node tests/e2e/smoke-browser.mjs` verifies all of the above plus CORS from a real page origin.
+
+---
+
+## 4. E2E suite (`tests/e2e/*.test.mjs`)
+
+```sh
+npm run test:e2e                        # = node --test --test-concurrency=1 "tests/e2e/**/*.test.mjs"  (~4–5 min)
+node --test tests/e2e/05-oauth.test.mjs # one file
+node --test --test-name-pattern="^9b" tests/e2e/05-oauth.test.mjs   # one test
+```
+
+Each file starts its own app server + mock Drive on ephemeral ports (`openSuite()` in `lib.mjs`)
+and its own headless Chromium; every test opens a fresh browser context (fresh storage and
+Service Worker registration). On failure every open page is saved as
+`tests/e2e/out/FAIL-<test>-<n>.png`; some tests also save reference screenshots there
+(`mobile-*.png`, `orientation-cathedral.png`, `heic-slide.png`). No npm dependencies: Playwright
+is loaded from the global install (`loadPlaywright()`).
+
+### How the tests observe the app
+
+* `window.__slideshow` (the app state, exposed on localhost): `items`, `player.slides/index/playing`,
+  `settings`, `sw`, `loader`, `session`.
+* An init script (`RECORDER` in `lib.mjs`) records, in page order, every slide that becomes
+  `#player .slide.visible` (`window.__slideLog`: kind, id, day, caption text, `<img>` natural size,
+  src and the colour of a pixel near the photo's corner — compared with the fixture's `bgColor` to
+  prove the *right* picture is on screen), every toast (`window.__toasts`) and the progress of every
+  `<video>` (`window.__video[id]`: max `currentTime`, `videoWidth`, `src`, `muted`).
+* The mock's request log (`admin.log()`): auth type, Range, resource-key header, origin (requests
+  with the app origin and `mode: cors` come from the Service Worker), status.
+* Settings are seeded into `localStorage` before the first load (`FAST_SETTINGS`: 1 s photos,
+  2 s videos, no auto refresh) unless a test passes `settings: null`; URL parameters still win.
+* Google Identity Services is replaced by `GIS_STUB` (route on `accounts.google.com/gsi/client`):
+  `window.__nextToken`, `__nextExpiresIn`, `__nextTokenError` steer the next token response and
+  `window.__gis.requests` counts token requests. `https://drive.google.com/**` (the `/preview`
+  iframe) is answered with a stub page and recorded (`app.previewRequests`).
+
+### Files and scenarios
+
+| file | tests |
+|---|---|
+| `01-catalog` | 1 order/times/exclusions/shortcuts/pagination/title & day cards · 1b metadata cache on reload · 3 background EXIF refinement · 3b refinement with a wrong trip zone (requests held with `route`) |
+| `02-playthrough` | 2 full playthrough (sequence, captions, colours, SW Range streaming, HEVC → Drive embed, 2 s video cap, loop) · 2b SW proxy contract · 2c Content-Range hidden by CORS (header-stripping proxy) · **10 [APP BUG]** `serviceWorkers:'block'` · 10a/10b no Service Worker API (direct URL / blob) |
+| `03-grid-refresh-controls` | 4 Canon −6 h correction via the grid, persisted · 5 manual refresh · **5c [APP BUG]** current photo deleted → next item skipped · 5b automatic refresh (`?refresh=0.05`) · 6 keyboard + HUD controls |
+| `04-errors-reskey-share` | 7a start-up errors · 7b form validation + URL forms · **7b2 [APP BUG]** invalid time zone accepted silently · 7c broken photo skipped · 7d thumbnail fallback · 8 resource keys · 15 share link |
+| `05-oauth` | 9a OAuth start · 9b token expiry → overlay → re-login · 9c folder search / login status · 9d HEVC fallback in OAuth · 9e expiring banner · 9f login denied/cancelled · **9g [APP BUG]** two tabs with different credentials |
+| `06-media-mobile` | 11 HEIC via heic-to (skipped when jsDelivr is unreachable) · 11c HEIC without CDN → thumbnail · 11b fast (thumbnail) quality · 12 EXIF orientation · 13 mobile 390×844 + swipe · 16 loop=0 end card · 17 cancel loading · 18 sound after a click / muted autostart |
+| `07-big-folder` | 14 `folder_big` (120 photos, pages of 50), grid with 120 tiles |
+| `08-settings` | 19 display settings from the form, persisted; sub-folder switch; full screen |
+| `09-private-thumbnails` | 20 thumbnails needing auth (`thumbAuth: 'required'`): show unaffected, grid fallback tiles |
+
+Tests whose title starts with **`[APP BUG]`** reproduce a defect of the app and fail until it is
+fixed (the assertion message names the suspected code). Keep them failing rather than weakening them.
