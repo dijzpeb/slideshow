@@ -222,13 +222,18 @@ export class MediaLoader {
     if (!e.settled) e.ctrl.abort(abortError());
   }
 
+  /** キャッシュから外して、読み込み中なら中止し、読み込めたら Blob URL を解放する */
+  _release(e) {
+    this._abortEntry(e);
+    e.promise.then((r) => r && r.revoke && r.revoke()).catch(() => {});
+  }
+
   _evict(keep) {
     if (this.cache.size <= this.maxCached) return;
     const entries = [...this.cache.entries()].filter(([id]) => !keep.has(id)).sort((a, b) => a[1].lastUsed - b[1].lastUsed);
     while (this.cache.size > this.maxCached && entries.length) {
       const [, e] = entries.shift();
-      this._abortEntry(e);
-      e.promise.then((r) => r && r.revoke && r.revoke()).catch(() => {});
+      this._release(e);
     }
   }
 
@@ -267,6 +272,8 @@ export class MediaLoader {
     if (entry && entry.sig === item.modifiedTime) {
       this._touch(item.id);
     } else {
+      // ファイルが更新された（modifiedTime が変わった）: 古い版の読み込みを止めて Blob URL を解放する
+      if (entry) this._release(entry);
       entry = this._startImage(item);
       this._evict(new Set([item.id, ...(keep || [])]));
     }
@@ -491,10 +498,7 @@ export class MediaLoader {
   }
 
   clear() {
-    for (const e of [...this.cache.values()]) {
-      this._abortEntry(e);
-      e.promise.then((r) => r && r.revoke && r.revoke()).catch(() => {});
-    }
+    for (const e of [...this.cache.values()]) this._release(e);
     this.cache.clear();
     for (const p of this.exifThumbs.values()) p.then((u) => u && URL.revokeObjectURL(u)).catch(() => {});
     this.exifThumbs.clear();

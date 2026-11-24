@@ -188,3 +188,41 @@ test('loader: a transient 503 is retried in the page; aborting during the backof
   await new Promise((r) => setTimeout(r, 1500));
   assert.equal(busy.requests.length, 1, 'no upstream request after the abort');
 });
+
+test('loader: a photo whose modifiedTime changed replaces the old entry: its download is aborted and its Blob URL revoked', async () => {
+  const { loader, requests, item, finish } = setup();
+  const revoked = [];
+  const origRevoke = URL.revokeObjectURL;
+  URL.revokeObjectURL = (u) => {
+    revoked.push(u);
+    origRevoke.call(URL, u);
+  };
+  try {
+    // in flight when the file changes in Drive → the old download stops
+    const v1 = item('A');
+    const v2 = { ...v1, modifiedTime: '2025-02-01T00:00:00Z' };
+    const p1 = loader.loadImage(v1);
+    await tick();
+    const p2 = loader.loadImage(v2);
+    await assert.rejects(p1, isAbort);
+    await tick();
+    assert.equal(requests[0].aborted, true, 'old version download aborted');
+    assert.equal(loader.cache.get('A').sig, v2.modifiedTime);
+    finish('A');
+    const r2 = await p2;
+    // already loaded when the file changes → the old Blob URL is released
+    const v3 = { ...v1, modifiedTime: '2025-03-01T00:00:00Z' };
+    const p3 = loader.loadImage(v3);
+    await tick();
+    await tick();
+    assert.ok(revoked.includes(r2.url), 'old Blob URL revoked');
+    assert.equal(loader.cache.size, 1);
+    finish('A');
+    const r3 = await p3;
+    loader.clear();
+    await tick();
+    assert.ok(revoked.includes(r3.url), 'clear() releases the current version');
+  } finally {
+    URL.revokeObjectURL = origRevoke;
+  }
+});

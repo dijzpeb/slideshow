@@ -7,6 +7,8 @@ const TOKEN_KEY = 'finland-slideshow.token.v1';
 const TOKEN_MARGIN_MS = 60000;
 /** ログインのポップアップが応答しないときに諦めるまでの時間 */
 export const REQUEST_TIMEOUT_MS = 120000;
+/** 期限のこれだけ前に 'expiring' を知らせる */
+export const EXPIRY_WARNING_MS = 5 * 60000;
 
 let gisPromise = null;
 
@@ -87,7 +89,7 @@ export class OAuthSession extends EventTarget {
     if (!this.tokenData || this.disposed) return;
     const now = Date.now();
     const exp = this.tokenData.expiresAt;
-    const warnAt = exp - 5 * 60000;
+    const warnAt = exp - EXPIRY_WARNING_MS;
     // setTimeout の上限（約 24.8 日）を超えないよう念のため制限
     const clamp = (ms) => Math.min(Math.max(0, ms), 2 ** 31 - 1);
     if (warnAt > now) this.timers.push(setTimeout(() => this.dispatchEvent(new Event('expiring')), clamp(warnAt - now)));
@@ -129,6 +131,8 @@ export class OAuthSession extends EventTarget {
    * トークンを要求する（ポップアップが開くため、クリックなどのユーザー操作の中で呼ぶこと）。
    * 一度許可済みなら、ポップアップはすぐに閉じる。
    * 前の要求が終わっていなければ（ポップアップが裏に隠れた等）もう一度開いて、同じ promise を返す。
+   * GIS は同じ名前のポップアップを使い回して前面に出し、前の要求の結果は捨てる。ポップアップを閉じた通知は
+   * 何度要求しても 1 回だけなので、待っている間に届いたエラーはそのまま要求の結果にする。
    * 応答がないまま REQUEST_TIMEOUT_MS たつと AuthError で失敗する。
    */
   request({ prompt = '' } = {}) {
@@ -139,7 +143,6 @@ export class OAuthSession extends EventTarget {
       try {
         // GIS がポップアップを前面に出す（または開き直す）
         this.client.requestAccessToken({ prompt });
-        p.outstanding++;
         this._armTimeout(p);
       } catch {
         /* 前の要求の結果を待つ */
@@ -152,7 +155,7 @@ export class OAuthSession extends EventTarget {
       resolve = res;
       reject = rej;
     });
-    const entry = { promise, resolve, reject, outstanding: 1, timer: null };
+    const entry = { promise, resolve, reject, timer: null };
     this.pending = entry;
     try {
       this.client.requestAccessToken({ prompt });
@@ -215,12 +218,6 @@ export class OAuthSession extends EventTarget {
   }
 
   _onError(err) {
-    const p = this.pending;
-    if (p && p.outstanding > 1) {
-      // 開き直す前のポップアップが閉じられた通知。開き直したほうの結果を待つ
-      p.outstanding--;
-      return;
-    }
     const type = (err && err.type) || 'unknown';
     const msg =
       type === 'popup_failed_to_open'

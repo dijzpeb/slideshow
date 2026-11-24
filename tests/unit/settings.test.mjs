@@ -8,6 +8,8 @@ import {
   offsetsForFolder,
   withFolderOffsets,
   migrateStoredOffsets,
+  legacyOffsetsForFolder,
+  withoutLegacyOffsets,
   saveSettings,
   DEFAULTS,
 } from '../../js/settings.js';
@@ -101,7 +103,8 @@ test('share URL carries the current folder corrections and round-trips', () => {
   });
   const url = buildShareUrl('https://x.github.io/slideshow/?old=1#h', settings);
   const u = new URL(url);
-  assert.deepEqual(u.searchParams.getAll('fix'), ['-360:Canon EOS R6', '90:SONY ILCE-7M4（タイムゾーン記録あり）', '5:Odd: name & co?']);
+  // fix=* で、このフォルダの補正のすべてであることを示す
+  assert.deepEqual(u.searchParams.getAll('fix'), ['-360:Canon EOS R6', '90:SONY ILCE-7M4（タイムゾーン記録あり）', '5:Odd: name & co?', '*']);
   assert.equal(u.searchParams.get('old'), null);
   // URL から読み直すと、そのフォルダの補正になる
   const fromUrl = settingsFromUrl(u.search);
@@ -110,9 +113,9 @@ test('share URL carries the current folder corrections and round-trips', () => {
   assert.deepEqual(offsetsForFolder(loaded, FOLDER), { 'Canon EOS R6': -360, 'SONY ILCE-7M4（タイムゾーン記録あり）': 90, 'Odd: name & co?': 5 });
   assert.equal(loaded.authMode, 'apikey');
   assert.equal(loaded.apiKey, 'K');
-  // 補正がないフォルダでは fix を付けない
+  // 補正がないフォルダでも fix=*（開いた側の古い補正を消す）
   const plain = new URL(buildShareUrl('https://x.github.io/slideshow/', { ...settings, folder: 'NOFIX' }));
-  assert.deepEqual(plain.searchParams.getAll('fix'), []);
+  assert.deepEqual(plain.searchParams.getAll('fix'), ['*']);
   assert.equal(new URL(buildShareUrl('https://x.github.io/slideshow/', { ...settings, folder: '' })).searchParams.has('fix'), false);
 });
 
@@ -140,6 +143,31 @@ test('loadSettings merges URL corrections over the stored ones for that folder o
   assert.deepEqual(legacyWithUrl.cameraOffsets, { A: { 'Canon EOS R6': -360 } });
 });
 
+test('share link replaces the recipient\'s corrections for that folder (fix=*); a hand-written fix= list merges', () => {
+  const settings = sanitize({ ...DEFAULTS, folder: FOLDER, authMode: 'apikey', apiKey: 'K', cameraOffsets: { [FOLDER]: { 'Canon EOS R6': -360 } } });
+  // the recipient opened an older link (Canon −6 h, Sony +30 min) and has a correction for another folder
+  const recipient = {
+    folder: FOLDER,
+    cameraOffsets: { [FOLDER]: { 'Canon EOS R6': -300, 'SONY ILCE-7M4': 30 }, OTHER: { cam: 5 } },
+    legacyCameraOffsets: { [FOLDER]: { '動画（機種不明）': -180 }, OTHER: { cam: 5 } },
+  };
+  const link = new URL(buildShareUrl('https://x.github.io/slideshow/', settings));
+  const fromUrl = settingsFromUrl(link.search);
+  assert.equal(fromUrl.replaceCameraOffsets, true);
+  const loaded = withStorage(recipient, () => loadSettings({}, link.search));
+  assert.deepEqual(loaded.cameraOffsets, { OTHER: { cam: 5 }, [FOLDER]: { 'Canon EOS R6': -360 } }, 'the link\'s set, not merged');
+  assert.deepEqual(loaded.legacyCameraOffsets, { OTHER: { cam: 5 } }, 'old corrections of that folder are not migrated over the link');
+  assert.equal('replaceCameraOffsets' in loaded, false);
+  // the sharer removed every correction: the link still clears the recipient's
+  const none = new URL(buildShareUrl('https://x.github.io/slideshow/', { ...settings, cameraOffsets: {} }));
+  assert.deepEqual(settingsFromUrl(none.search).cameraOffsets, { [FOLDER]: {} });
+  assert.deepEqual(withStorage(recipient, () => loadSettings({}, none.search)).cameraOffsets, { OTHER: { cam: 5 } });
+  // a hand-written link without fix=* merges into the saved corrections
+  const partial = withStorage(recipient, () => loadSettings({}, `?folder=${FOLDER}&fix=-360:Canon%20EOS%20R6`));
+  assert.deepEqual(partial.cameraOffsets[FOLDER], { 'Canon EOS R6': -360, 'SONY ILCE-7M4': 30 });
+  assert.deepEqual(partial.legacyCameraOffsets, recipient.legacyCameraOffsets);
+});
+
 test('loadSettings migrates the previous flat cameraOffsets to the folder saved with them', () => {
   const url = `https://drive.google.com/drive/folders/${FOLDER}?resourcekey=0-x`;
   const old = { folder: url, cameraOffsets: { 'Canon EOS R6': -360, '動画（機種不明）': -540, bad: 'x' } };
@@ -155,9 +183,17 @@ test('loadSettings migrates the previous flat cameraOffsets to the folder saved 
     const loaded = loadSettings({}, '');
     assert.deepEqual(loaded.cameraOffsets, { [FOLDER]: { 'Canon EOS R6': -360, '動画（機種不明）': -540 } });
     assert.deepEqual(offsetsForFolder(loaded, FOLDER), { 'Canon EOS R6': -360, '動画（機種不明）': -540 });
+    // 以前のグループ名のままの値も残す（グループの分け方が変わったファイルに移すため。catalog.migrateLegacyOffsets）
+    assert.deepEqual(legacyOffsetsForFolder(loaded, FOLDER), { 'Canon EOS R6': -360, '動画（機種不明）': -540 });
     // 次の保存で新しい形式になる（消えない）
     saveSettings(loaded);
     assert.deepEqual(saved.cameraOffsets, { [FOLDER]: { 'Canon EOS R6': -360, '動画（機種不明）': -540 } });
+    assert.deepEqual(saved.legacyCameraOffsets, { [FOLDER]: { 'Canon EOS R6': -360, '動画（機種不明）': -540 } });
+    // 今のグループに移し終えたら消す（他のフォルダはそのまま）
+    const done = withoutLegacyOffsets({ ...loaded, legacyCameraOffsets: { ...loaded.legacyCameraOffsets, B: { x: 1 } } }, FOLDER);
+    assert.deepEqual(done.legacyCameraOffsets, { B: { x: 1 } });
+    assert.deepEqual(legacyOffsetsForFolder(done, FOLDER), {});
+    assert.deepEqual(done.cameraOffsets, loaded.cameraOffsets);
   } finally {
     delete global.localStorage;
   }

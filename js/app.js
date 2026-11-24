@@ -1,11 +1,30 @@
 // アプリ本体: 設定画面 → フォルダの読み込み → 撮影日時の解析 → スライドショー
 
 import { $, $$, h, icon, toast } from './dom.js';
-import { loadSettings, saveSettings, sanitize, buildShareUrl, resolveApiBase, DEFAULTS, offsetsForFolder, withFolderOffsets } from './settings.js';
-import { OAuthSession, AuthError } from './auth.js';
+import {
+  loadSettings,
+  saveSettings,
+  sanitize,
+  buildShareUrl,
+  resolveApiBase,
+  DEFAULTS,
+  offsetsForFolder,
+  withFolderOffsets,
+  legacyOffsetsForFolder,
+  withoutLegacyOffsets,
+} from './settings.js';
+import { OAuthSession, AuthError, EXPIRY_WARNING_MS } from './auth.js';
 import { DriveClient, DriveError, AuthRequiredError, parseFolderInput } from './drive.js';
 import { extractAll, readCached } from './extract.js';
-import { buildCatalog, summarizeGroups, buildSlides, TIME_SOURCE_LABELS, ZONED_GROUP_SUFFIX, MVHD_VIDEO_GROUP_SUFFIX } from './catalog.js';
+import {
+  buildCatalog,
+  summarizeGroups,
+  buildSlides,
+  migrateLegacyOffsets,
+  TIME_SOURCE_LABELS,
+  ZONED_GROUP_SUFFIX,
+  MVHD_VIDEO_GROUP_SUFFIX,
+} from './catalog.js';
 import { MediaLoader, setupServiceWorker } from './loader.js';
 import { Player } from './player.js';
 import { formatDateJa, formatTimeJa, formatDateTimeJa, isValidTimeZone, tzOffsetMs, formatOffset } from './timeutil.js';
@@ -28,6 +47,7 @@ const state = {
   items: [],
   loadAbort: null,
   refineAbort: null,
+  refineInterrupted: false, // 撮影日時の精密解析がログイン切れで止まった（ログインし直したらやり直す）
   refreshAbort: null,
   refreshTimer: null,
   refreshing: false,
@@ -154,9 +174,15 @@ function onSessionChange(e) {
   const session = e.target;
   if (session !== state.session) return;
   // 十分に長いトークンになったら「まもなく期限切れ」の表示は不要
-  if (session.isValidFor(MIN_TOKEN_MS)) removeExpiringBanner();
+  if (session.isValidFor(EXPIRY_WARNING_MS)) removeExpiringBanner();
   updateLoginStatus();
   pushCreds();
+  if (state.screen === 'player' && isPlayerSession(session) && session.signedIn) {
+    // ログインし直せた（「ログインして続ける」でも「延長する」でも）: 期限切れの画面が出ていれば閉じて続きから再生し、
+    // ログイン切れで止まった撮影日時の精密解析をやり直す
+    if (!$('#auth-overlay').hidden) resumeAfterLogin();
+    if (state.refineInterrupted) refineInBackground();
+  }
 }
 
 function updateLoginStatus(errorMsg) {
@@ -202,6 +228,11 @@ function removeExpiringBanner() {
 function onTokenExpiring(e) {
   const session = e.target;
   if (state.screen !== 'player' || !isPlayerSession(session)) return;
+  showExpiringBanner(session);
+}
+
+/** 「まもなくログインの有効期限が切れます」の表示 */
+function showExpiringBanner(session) {
   removeExpiringBanner();
   const banner = h('div', { class: 'expiring-banner' }, [
     h('span', {}, ['まもなくログインの有効期限が切れます。']),
@@ -250,31 +281,51 @@ function showAuthOverlay(wasPlaying = false) {
   pushCreds();
   $('#auth-error').textContent = '';
   overlay.hidden = false;
+  // モーダル: 後ろのスライドショーと一覧にはフォーカスもクリックも届かないようにする
+  $('#player').inert = true;
+  $('#grid-overlay').inert = true;
   $('#btn-reauth').focus();
+}
+
+/** 再ログインの画面を閉じる（後ろの一覧が開いていれば、そこにフォーカスを戻す） */
+function hideAuthOverlay() {
+  const overlay = $('#auth-overlay');
+  if (overlay.hidden) return;
+  overlay.hidden = true;
+  const grid = $('#grid-overlay');
+  grid.inert = false;
+  $('#player').inert = !grid.hidden;
+  if (!grid.hidden) grid.focus({ preventScroll: true });
+}
+
+/** ログインし直せたあと: 再ログインの画面を閉じて、止まっていたスライドから続ける */
+function resumeAfterLogin() {
+  hideAuthOverlay();
+  pushCreds();
+  // 止まっていたスライドを読み込み直す（読み込めたときに再生中なら、そのまま再生が始まる）
+  state.player?.retry();
+  // 一覧が開いているときや一時停止中だったときは再生を始めない（一覧を閉じたときに決める）
+  if (authWasPlaying && $('#grid-overlay').hidden) state.player?.play();
+  authWasPlaying = false;
 }
 
 $('#btn-reauth').addEventListener('click', async () => {
   const session = state.session;
   if (!session || state.drive?.mode !== 'oauth') {
-    $('#auth-overlay').hidden = true;
+    hideAuthOverlay();
     return;
   }
   try {
     if (!session.client) await session.init();
     await session.request({ prompt: '' });
-    if (session !== state.session || state.screen !== 'player') return;
-    $('#auth-overlay').hidden = true;
-    pushCreds();
-    // 一覧が開いているときや一時停止中だったときは再生を始めない（一覧を閉じたときに決める）
-    if (authWasPlaying && $('#grid-overlay').hidden) state.player?.play();
-    authWasPlaying = false;
-    state.player?.retry();
+    // 新しいトークンが届いたときに onSessionChange が続きから再生している
+    if (session === state.session && state.screen === 'player' && !$('#auth-overlay').hidden) resumeAfterLogin();
   } catch (e) {
     $('#auth-error').textContent = e.message;
   }
 });
 $('#btn-auth-cancel').addEventListener('click', () => {
-  $('#auth-overlay').hidden = true;
+  hideAuthOverlay();
   backToSetup();
 });
 
@@ -409,6 +460,7 @@ function endSession() {
   cancelRefresh();
   state.refineAbort?.abort();
   state.refineAbort = null;
+  state.refineInterrupted = false;
 }
 
 async function start() {
@@ -419,13 +471,17 @@ async function start() {
   const abort = new AbortController();
   state.loadAbort = abort;
   endSession();
+  // フォルダ検索の画面は閉じる（ログインの完了を待っている間に開始が押された場合など）
+  $('#folder-overlay').hidden = true;
   const stale = () => abort.signal.aborted || state.loadAbort !== abort;
   try {
-    state.drive = makeDrive(s);
+    // この DriveClient がフォルダ・ファイルのリソースキーを覚えるので、再生・更新・精密解析にも同じものを使う
+    const drive = makeDrive(s);
+    state.drive = drive;
     const folder = parseFolderInput(s.folder);
-    if (folder.resourceKey) state.drive.rememberResourceKey(folder.id, folder.resourceKey);
+    if (folder.resourceKey) drive.rememberResourceKey(folder.id, folder.resourceKey);
     const swP = ensureServiceWorker();
-    const listing = await state.drive.listMediaTree(folder.id, {
+    const listing = await drive.listMediaTree(folder.id, {
       recursive: s.includeSubfolders,
       signal: abort.signal,
       onProgress: ({ folders, files }) => setLoading('フォルダを読み込み中…', `${folders} フォルダ・写真と動画 ${files} 件`),
@@ -439,7 +495,7 @@ async function start() {
       );
     }
     setLoading('撮影日時を確認中…', '', 0);
-    const required = await extractAll(state.drive, state.files, {
+    const required = await extractAll(drive, state.files, {
       phases: ['required'],
       signal: abort.signal,
       onProgress: (done, total) => total && setLoading('撮影日時を確認中…', `${done} / ${total}（動画など）`, done / total),
@@ -473,6 +529,7 @@ async function start() {
 /** 写真の EXIF をファイルから直接読み、撮影時刻をより正確にする（再生を止めずに裏で実行） */
 async function refineInBackground() {
   state.refineAbort?.abort();
+  state.refineInterrupted = false;
   if (!state.settings.preciseTimes || !state.drive || !state.root) return;
   const abort = new AbortController();
   state.refineAbort = abort;
@@ -513,7 +570,10 @@ async function refineInBackground() {
       },
     });
   } catch (e) {
-    if (!stale()) console.info('撮影日時の精密解析を中断しました:', e && e.message);
+    if (!stale()) {
+      console.info('撮影日時の精密解析を中断しました:', e && e.message);
+      if (e instanceof AuthRequiredError) state.refineInterrupted = true;
+    }
   }
   if (!stale()) apply();
 }
@@ -524,8 +584,17 @@ function currentFolderId() {
 }
 
 function rebuildCatalog() {
+  const folderId = currentFolderId();
+  // 以前の版で保存した補正を、グループの分け方が変わったファイル（機種名が読めるようになった動画など）の今のグループにも
+  // 移す（以前と同じファイルに同じ補正がかかるように）。次に設定を保存したときに新しい形式で保存される
+  const legacy = legacyOffsetsForFolder(state.settings, folderId);
+  if (Object.keys(legacy).length) {
+    const own = offsetsForFolder(state.settings, folderId);
+    const moved = migrateLegacyOffsets(state.files, state.extracted, { timeZone: state.settings.timeZone, cameraOffsets: own, legacyOffsets: legacy });
+    state.settings = sanitize(withoutLegacyOffsets(withFolderOffsets(state.settings, folderId, { ...moved, ...own }), folderId));
+  }
   const s = state.settings;
-  state.items = buildCatalog(state.files, state.extracted, { timeZone: s.timeZone, cameraOffsets: offsetsForFolder(s, currentFolderId()) });
+  state.items = buildCatalog(state.files, state.extracted, { timeZone: s.timeZone, cameraOffsets: offsetsForFolder(s, folderId) });
 }
 
 function title() {
@@ -557,6 +626,9 @@ function startPlayer() {
   document.title = `${title()} - スライドショー`;
   showScreen('player');
   state.player.start(0);
+  // 読み込み中に「まもなく期限切れ」の時刻を過ぎていたら（'expiring' は読み込み中に届いて使われなかった）、ここで知らせる
+  const session = state.session;
+  if (isPlayerSession(session) && session.signedIn && !session.isValidFor(EXPIRY_WARNING_MS)) showExpiringBanner(session);
 }
 
 function backToSetup() {
@@ -565,7 +637,7 @@ function backToSetup() {
   endSession();
   state.player?.stop();
   removeExpiringBanner();
-  $('#auth-overlay').hidden = true;
+  hideAuthOverlay();
   hideGrid();
   if (document.fullscreenElement) document.exitFullscreen?.().catch(() => {});
   fillForm(state.settings);
@@ -875,12 +947,16 @@ function renderTimeFix({ keepEdits = false } = {}) {
   }
   const saved = offsetsForFolder(s, currentFolderId());
   const groups = summarizeGroups(state.items);
+  // 補正を保存してあっても今は該当するファイルがないグループ（裏の EXIF の解析が終わると現れるものなど）も、確認・取り消しできるよう表示する
+  for (const g of Object.keys(saved)) {
+    if (!groups.some((x) => x.group === g)) groups.push({ group: g, count: 0, photos: 0, videos: 0 });
+  }
   const rows = groups.map((g) => {
     const off = (Object.prototype.hasOwnProperty.call(saved, g.group) && Number(saved[g.group])) || 0;
     const sign = off < 0 ? -1 : 1;
     const hh = h('input', { type: 'number', min: '-48', max: '48', step: '1', value: String(sign * Math.floor(Math.abs(off) / 60)), 'aria-label': `${g.group} の補正（時間）`, class: 'num-sm' });
     const mm = h('input', { type: 'number', min: '-59', max: '59', step: '1', value: String(sign * (Math.abs(off) % 60)), 'aria-label': `${g.group} の補正（分）`, class: 'num-sm' });
-    const range = g.count ? `${formatDateTimeJa(g.first, s.timeZone)} 〜 ${formatDateTimeJa(g.last, s.timeZone)}` : '';
+    const range = g.count ? `${formatDateTimeJa(g.first, s.timeZone)} 〜 ${formatDateTimeJa(g.last, s.timeZone)}` : '今は該当する写真・動画がありません';
     return h('div', { class: 'fix-row', dataset: { group: g.group } }, [
       h('div', { class: 'fix-name' }, [h('strong', {}, [g.group]), h('span', { class: 'muted' }, [` 写真 ${g.photos}・動画 ${g.videos}`]), h('div', { class: 'muted small' }, [range])]),
       h('label', { class: 'fix-input' }, [hh, ' 時間 ', mm, ' 分']),
@@ -905,13 +981,16 @@ function renderTimeFix({ keepEdits = false } = {}) {
 }
 
 $('#btn-time-fix-apply').addEventListener('click', () => {
-  const offsets = {};
+  const folderId = currentFolderId();
+  // 表にあるグループだけを変える（表にないグループの保存済みの補正は残す）
+  const offsets = offsetsForFolder(state.settings, folderId);
   for (const row of $$('#time-fix-table .fix-row')) {
     const [hh, mm] = $$('input', row).map((i) => Number(i.value) || 0);
     const total = Math.round(hh * 60 + mm);
     if (total) offsets[row.dataset.group] = total;
+    else delete offsets[row.dataset.group];
   }
-  state.settings = sanitize(withFolderOffsets(state.settings, currentFolderId(), offsets));
+  state.settings = sanitize(withFolderOffsets(state.settings, folderId, offsets));
   saveSettings(state.settings);
   rebuildCatalog();
   state.player?.setItems(state.items);
@@ -931,6 +1010,7 @@ $('#btn-folder-search').addEventListener('click', async () => {
     return;
   }
   const session = ensureSession(s.clientId);
+  const gen = sessionGen;
   if (!session.isValidFor(MIN_TOKEN_MS)) {
     try {
       if (!session.client) await session.init();
@@ -939,20 +1019,26 @@ $('#btn-folder-search').addEventListener('click', async () => {
       setupError(e.message);
       return;
     }
+    // ログインを待っている間にスライドショーが始まった（「スライドショーを開始」も押された）: 検索は開かない
+    if (state.screen !== 'setup' || gen !== sessionGen) return;
   }
-  state.drive = makeDrive({ ...s, authMode: 'oauth' });
+  // 検索用の DriveClient（スライドショーの state.drive は変えない）
+  folderDrive = makeDrive({ ...s, authMode: 'oauth' });
   $('#folder-overlay').hidden = false;
   $('#folder-query').focus();
   searchFolders('');
 });
 
+/** フォルダ検索に使う DriveClient */
+let folderDrive = null;
 let folderSearchSeq = 0;
 async function searchFolders(q) {
   const ul = $('#folder-results');
   const seq = ++folderSearchSeq;
   ul.replaceChildren(h('li', { class: 'muted' }, ['検索中…']));
   try {
-    const folders = await state.drive.searchFolders(q);
+    if (!folderDrive) throw new Error('先に「フォルダを検索」を押してください。');
+    const folders = await folderDrive.searchFolders(q);
     if (seq !== folderSearchSeq) return; // 新しい検索の結果を優先
     if (!folders.length) {
       ul.replaceChildren(h('li', { class: 'muted' }, ['見つかりませんでした']));

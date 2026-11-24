@@ -18,9 +18,11 @@ import {
   offsetMatchesZone,
   UNKNOWN_PHOTO_GROUP,
   UNKNOWN_VIDEO_GROUP,
+  legacyCameraGroup,
+  migrateLegacyOffsets,
 } from '../../js/catalog.js';
 import { parseFolderInput, mediaKind, normalizeMimeType, escapeQueryValue } from '../../js/drive.js';
-import { sanitize, settingsFromUrl, loadSettings, buildShareUrl, resolveApiBase, DEFAULTS } from '../../js/settings.js';
+import { sanitize, settingsFromUrl, loadSettings, buildShareUrl, resolveApiBase, DEFAULTS, offsetsForFolder, legacyOffsetsForFolder } from '../../js/settings.js';
 
 const TZ = 'Europe/Helsinki';
 const iso = (t) => new Date(t).toISOString();
@@ -360,4 +362,64 @@ test('resolveApiBase only allows overrides on localhost', () => {
   assert.equal(resolveApiBase({ hostname: '127.0.0.1', search: '?apiBase=http://127.0.0.1:8787/' }), 'http://127.0.0.1:8787');
   assert.equal(resolveApiBase({ hostname: 'localhost', search: '?apiBase=https://evil.example.com' }), 'https://www.googleapis.com');
   assert.equal(resolveApiBase({ hostname: 'localhost', search: '' }), 'https://www.googleapis.com');
+});
+
+test('legacy corrections (saved by the previous version) keep applying to the same files after the groups changed', () => {
+  const F = '1AbCdEfGhIjKlMnOpQrStUvWxYz012345';
+  // the previous version saved { group: minutes } with the folder; its video groups were the label read from the
+  // Apple mdta / ©mak / ©mod keys, else 動画（機種不明） (Canon CMT1 / Android keys and file names were not used)
+  global.localStorage = {
+    getItem: () => JSON.stringify({ folder: F, cameraOffsets: { '動画（機種不明）': -180, 'Canon EOS R6': -60, 'Apple iPhone 15': 30 } }),
+    setItem() {},
+    removeItem() {},
+  };
+  let s;
+  try {
+    s = loadSettings({}, '');
+  } finally {
+    delete global.localStorage;
+  }
+  const files = [
+    { id: 'canon', name: 'MVI_0042.MP4', mimeType: 'video/mp4' },
+    { id: 'gopro', name: 'GX010123.MP4', mimeType: 'video/mp4' },
+    { id: 'pixel', name: 'clip.mp4', mimeType: 'video/mp4' },
+    { id: 'plain', name: 'clip2.mp4', mimeType: 'video/mp4' },
+    { id: 'iphone', name: 'IMG_0001.MOV', mimeType: 'video/quicktime' },
+    { id: 'iphone_z', name: 'IMG_0002.MOV', mimeType: 'video/quicktime' },
+    { id: 'photo', name: 'IMG_0003.JPG', mimeType: 'image/jpeg', imageMediaMetadata: { time: '2025:07:13 15:00:00', cameraMake: 'Canon', cameraModel: 'Canon EOS R6' } },
+  ];
+  const t = Date.UTC(2025, 6, 13, 15);
+  const ex = new Map([
+    ['canon', { kind: 'video', epoch: t, source: 'mp4-mvhd', offsetMinutes: null, make: 'Canon', model: 'Canon EOS R6', legacyLabel: false }],
+    ['gopro', { kind: 'video', epoch: t, source: 'mp4-mvhd', offsetMinutes: null }],
+    ['pixel', { kind: 'video', epoch: t, source: 'mp4-mvhd', offsetMinutes: null, make: 'Google', model: 'Pixel 8', legacyLabel: false }],
+    ['plain', { kind: 'video', epoch: t, source: 'mp4-mvhd', offsetMinutes: null }],
+    // mvhd only (no creationdate): read with the Apple keys before too
+    ['iphone', { kind: 'video', epoch: t, source: 'mp4-mvhd', offsetMinutes: null, make: 'Apple', model: 'iPhone 15', legacyLabel: true }],
+    // recorded with another UTC offset: never gets a local-time correction
+    ['iphone_z', { kind: 'video', epoch: t, source: 'mp4-apple', offsetMinutes: 540, make: 'Apple', model: 'iPhone 15', legacyLabel: true }],
+  ]);
+  assert.equal(legacyCameraGroup(files[0], ex.get('canon'), 'video'), UNKNOWN_VIDEO_GROUP);
+  assert.equal(legacyCameraGroup(files[4], ex.get('iphone'), 'video'), 'Apple iPhone 15');
+  assert.equal(legacyCameraGroup(files[6], null, 'image'), 'Canon EOS R6');
+  // results cached before legacyLabel existed: only Apple labels count as read before
+  assert.equal(legacyCameraGroup(files[0], { make: 'Canon', model: 'Canon EOS R6' }, 'video'), UNKNOWN_VIDEO_GROUP);
+  assert.equal(legacyCameraGroup(files[4], { make: 'Apple', model: 'iPhone 15' }, 'video'), 'Apple iPhone 15');
+
+  const own = offsetsForFolder(s, F);
+  const legacy = legacyOffsetsForFolder(s, F);
+  assert.deepEqual(legacy, { '動画（機種不明）': -180, 'Canon EOS R6': -60, 'Apple iPhone 15': 30 });
+  const add = migrateLegacyOffsets(files, ex, { timeZone: TZ, cameraOffsets: own, legacyOffsets: legacy });
+  assert.deepEqual(add, {
+    'Canon EOS R6（動画）': -180,
+    'GoPro（ファイル名から推定）': -180,
+    'Google Pixel 8（動画）': -180,
+    'Apple iPhone 15（動画）': 30,
+  });
+  const items = buildCatalog(files, ex, { timeZone: TZ, cameraOffsets: { ...add, ...own } });
+  const off = Object.fromEntries(items.map((i) => [i.id, i.offsetMinutes]));
+  assert.deepEqual(off, { canon: -180, gopro: -180, pixel: -180, plain: -180, iphone: 30, iphone_z: 0, photo: -60 }, 'the same offsets as the previous version');
+  // nothing to move when every group already has its own correction
+  assert.deepEqual(migrateLegacyOffsets(files, ex, { timeZone: TZ, cameraOffsets: { ...add, ...own }, legacyOffsets: legacy }), {});
+  assert.deepEqual(migrateLegacyOffsets(files, ex, { timeZone: TZ, cameraOffsets: own, legacyOffsets: {} }), {});
 });

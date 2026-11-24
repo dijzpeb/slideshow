@@ -2,7 +2,8 @@
 
 ```
 tests/
-  unit/                     unit tests of the app modules (node --test, owned by the app)
+  unit/                     unit tests of the app modules (node --test, owned by the app; auth.test.mjs stubs
+                            Google Identity Services with one shared popup, like the real library)
   fixtures/generate.py      builds the media fixtures + manifest.json (the test oracle)
   fixtures/out/             generated output (git-ignored)
   mock-drive/server.mjs     mock of the Google Drive API v3 (node built-ins only)
@@ -389,7 +390,7 @@ await browser.close(); await env.close();
 ## 4. E2E suite (`tests/e2e/*.test.mjs`)
 
 ```sh
-npm run test:e2e                        # = node --test --test-concurrency=1 "tests/e2e/**/*.test.mjs"  (~4–5 min)
+npm run test:e2e                        # = node --test --test-concurrency=1 "tests/e2e/**/*.test.mjs"  (~6 min)
 node --test tests/e2e/05-oauth.test.mjs # one file
 node --test --test-name-pattern="^9b" tests/e2e/05-oauth.test.mjs   # one test
 ```
@@ -432,7 +433,7 @@ is loaded from the global install (`loadPlaywright()`).
 | `07-big-folder` | 14 `folder_big` (120 photos, pages of 50), grid with 120 tiles |
 | `08-settings` | 19 display settings from the form, persisted; sub-folder switch; full screen |
 | `09-private-thumbnails` | 20 thumbnails needing auth (`thumbAuth: 'required'`): show unaffected, grid fallback tiles |
-| `10-fixes` | regression tests of review findings: F5 SW ignores navigations / iframes, `nosniff` + CSP + safe Content-Type · F10 a single 503 on a photo download is retried → original shown · F10b/F24 an aborted photo download makes no further upstream requests (photo originals are fetched by the page, not the SW; the SW does not retry page `fetch()`) · F6 unreadable folder-shortcut target skipped (toast), show plays · F7/F14 a refresh held across a folder switch does not overwrite the new show · F1 corrections per folder + `fix=` in the share link · F0 corrections do not apply to `（タイムゾーン記録あり）` groups (an offset equal to the trip zone keeps the plain group) · F17 キャンセル during the SW wait · F19 Escape / G close the grid after focus left it · F13b a pause from outside the app pauses the show (no forced mute, no skip) · F18b 「次へ」 with audio locked keeps the outgoing video muted |
+| `10-fixes` | regression tests of review findings: F5 SW ignores navigations / iframes, `nosniff` + CSP + safe Content-Type · F10 a single 503 on a photo download is retried → original shown · F10b/F24 an aborted photo download makes no further upstream requests (photo originals are fetched by the page, not the SW; the SW does not retry page `fetch()`) · F6 unreadable folder-shortcut target skipped (toast), show plays · F7/F14 a refresh held across a folder switch does not overwrite the new show · F1 corrections per folder + `fix=…&fix=*` in the share link (replaces the recipient's older corrections of that folder) · F0 corrections do not apply to `（タイムゾーン記録あり）` groups (an offset equal to the trip zone keeps the plain group) · F17 キャンセル during the SW wait · F19 Escape / G close the grid after focus left it · F13b a pause from outside the app pauses the show (no forced mute, no skip) · F18b 「次へ」 with audio locked keeps the outgoing video muted · R3 適用 keeps saved corrections of groups not listed yet (EXIF read held with `route`; such groups are listed with 0 items) · R4 corrections saved by the previous version (flat format) still apply to videos whose group changed · R6 a tile picked while a video is paused under the grid: the old video is not resumed during a slow load (mock latency) · R7 → near the end of a video: the outgoing video stops, the next slide is not skipped · R8 a refresh removing the slide being loaded: the slide that moved into its place is shown · R9 the HUD hides again after 「もう一度見る」 / the list coming back from empty · R10 Media Session play / nexttrack ignored while the grid is open (handlers captured with an init script) · R11 pause during the muted autoplay retry (Safari policy emulated) keeps the video · R12 expiry banner when the show starts after the warning time · R13 「延長する」 finishing after expiry closes the re-login dialog · R14 the re-login dialog is modal (focus never reaches the grid) · R15 フォルダを検索 + スライドショーを開始 waiting for one login · R16 background EXIF refinement restarts after re-login |
 
 Tests whose title starts with **`[APP BUG]`** reproduce a defect of the app and fail until it is
 fixed (the assertion message names the suspected code). Keep them failing rather than weakening them.

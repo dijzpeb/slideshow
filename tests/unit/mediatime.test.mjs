@@ -97,6 +97,7 @@ test('mp4: Apple creationdate wins over mvhd; model is read', async () => {
     assert.equal(new Date(r.epoch).toISOString(), '2025-07-13T18:10:00.000Z');
     assert.equal(r.model, 'iPhone 15');
     assert.equal(r.make, 'Apple');
+    assert.equal(r.legacyLabel, true, 'the label was read by the previous version too');
     assert.equal(new Date(r.mvhdEpoch).toISOString(), '2025-08-01T00:00:00.000Z');
   }
 });
@@ -245,7 +246,7 @@ test('mp4: Android mdta keys com.android.manufacturer / com.android.model', asyn
   assert.equal(r.make, 'Google');
   assert.equal(r.model, 'Pixel 8');
   const info = await extractCaptureInfo(new BufferReader(file), 'video/mp4');
-  assert.deepEqual([info.make, info.model, info.offsetMinutes], ['Google', 'Pixel 8', null]);
+  assert.deepEqual([info.make, info.model, info.offsetMinutes, info.legacyLabel], ['Google', 'Pixel 8', null, false]);
 });
 
 test('mp4: Canon udta CNMN and uuid CMT1 give the model', async () => {
@@ -263,6 +264,7 @@ test('mp4: Canon udta CNMN and uuid CMT1 give the model', async () => {
   const r2 = await readMp4CreationTime(new BufferReader(mp4));
   assert.equal(r2.make, 'Canon');
   assert.equal(r2.model, 'Canon EOS R5');
+  assert.equal(r1.legacyLabel || r2.legacyLabel, false, 'CNMN / CMT1 were not read by the previous version');
   // 別の uuid は読まない
   const other = cat(box('ftyp', enc.encode('isom'), u32(0)), box('moov', mvhd(t), box('uuid', new Uint8Array(16).fill(7), cmt1)));
   const r3 = await readMp4CreationTime(new BufferReader(other));

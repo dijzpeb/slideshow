@@ -64,6 +64,7 @@ export class Player extends EventTarget {
     this.detached = false;
     this.drivePlayer = null; // {el, close}
     this._staleFns = new Set(); // seq が変わったときに呼ぶ関数
+    this._loadingSeq = 0; // 読み込み中の goTo の seq（読み込みが終わったら 0）
     this._retriedAbort = false;
 
     this._build();
@@ -196,7 +197,10 @@ export class Player extends EventTarget {
       // 空になった / 空から戻った
       if (!this.slides.length) {
         if (!wasEmpty) this.goTo(0);
-      } else if (wasEmpty) this.goTo(0);
+      } else if (wasEmpty) {
+        this.goTo(0);
+        this._showHud(); // 空のカードで固定していた操作パネルを、また自動で隠す
+      }
     }
   }
 
@@ -256,7 +260,17 @@ export class Player extends EventTarget {
       return;
     }
     if (cur.kind === 'end') {
-      if (!cur.empty || this.slides.length) this.goTo(0);
+      if (!cur.empty || this.slides.length) {
+        this.goTo(0);
+        this._showHud(); // おわりのカードで固定していた操作パネルを、また自動で隠す
+      }
+      return;
+    }
+    // 別のスライドへ移る途中: 出ていくスライド（動画）は再開しない。読み込み中なら読み込めたときに再生中として始まる。
+    // 読み込みをやめていれば（ログインが必要になった等）読み込み直す
+    if (this._navigating()) {
+      if (this._loadingSeq !== this.seq) this.goTo(this.index);
+      this._showHud();
       return;
     }
     if (cur.video && !cur.videoFailed) {
@@ -322,6 +336,11 @@ export class Player extends EventTarget {
     return true;
   }
 
+  /** 表示中のスライドの後に別のスライドへの移動（goTo）が始まっていて、まだ表示されていないか */
+  _navigating() {
+    return !!this.current && this.current.seq !== this.seq;
+  }
+
   /** 現在のスライドを読み込み直す（再ログイン後など） */
   retry() {
     this.goTo(this.index);
@@ -375,14 +394,18 @@ export class Player extends EventTarget {
     this.index = index;
     const seq = this._nextSeq();
     this._clearTimer();
+    // 出ていく動画は、次のスライドを読み込んでいる間も再生しない（seq が変わったので、その動画のイベントはもう何もしない）
+    if (this.current?.video && !this.current.video.paused) this.current.video.pause();
     this._updateCounter();
     const slide = this.slides[index];
     this._spinnerSoon();
+    this._loadingSeq = seq;
     let prepared;
     try {
       prepared = await this._prepare(slide, seq);
     } catch (e) {
       if (seq !== this.seq) return;
+      this._loadingSeq = 0;
       this._setSpinner(false);
       if (e instanceof AuthRequiredError) {
         const wasPlaying = this.playing;
@@ -390,10 +413,13 @@ export class Player extends EventTarget {
         this.onAuthRequired?.(e, { wasPlaying });
         return;
       }
+      // 読み込み中に setItems()（更新・精密解析）で並びが変わっていれば、index はこのスライドの新しい位置
+      // （消えていれば detached で、その位置に繰り上がったスライド）を指している。そこから数える
+      const at = this.index;
       // 表示しようとしている写真の読み込みが中止された（通常は起きない）: 一度だけ読み直す
       if (e && e.name === 'AbortError' && !this._retriedAbort) {
         this._retriedAbort = true;
-        this.goTo(index, direction);
+        this.goTo(at, direction);
         return;
       }
       console.warn('スライドを表示できません:', slide, e);
@@ -405,8 +431,9 @@ export class Player extends EventTarget {
         return;
       }
       // スキップ（戻る途中で先頭が読めなければ先へ進む）
-      if (direction < 0 && index > 0) this.goTo(index - 1, -1);
-      else if (index < this.slides.length - 1) this.goTo(index + 1, 1);
+      const forward = this.detached ? at : at + 1;
+      if (direction < 0 && at > 0) this.goTo(at - 1, -1);
+      else if (forward <= this.slides.length - 1) this.goTo(forward, 1);
       else if (this.getSettings().loop) this.goTo(0, 1);
       else this._showEnd();
       return;
@@ -415,13 +442,15 @@ export class Player extends EventTarget {
       prepared.cleanup();
       return;
     }
+    this._loadingSeq = 0;
     this._retriedAbort = false;
     this.consecutiveErrors = 0;
     this._setSpinner(false);
     this._swap(prepared.el, prepared);
     this._updateCaption(slide);
     this._begin(prepared);
-    this._preloadAround(index);
+    // 読み込み中に並びが変わっていても今の位置の周りを先読みする（消えたスライドなら index が次に表示するもの）
+    this._preloadAround(this.detached ? this.index - 1 : this.index);
   }
 
   _swap(el, prepared) {
@@ -446,7 +475,7 @@ export class Player extends EventTarget {
       if (fade) setTimeout(remove, 1300);
       else remove();
     }
-    this.current = { cleanup: () => {}, ...prepared, el };
+    this.current = { cleanup: () => {}, ...prepared, el, seq: this.seq };
     // 埋め込みプレーヤーにフォーカスが入ったままだとキー操作が届かないので戻す
     this._reclaimFocus();
     if (prepared.kind === 'video-embed' || old?.kind === 'video-embed') this._showHud();
@@ -721,12 +750,16 @@ export class Player extends EventTarget {
     let lastProgressAt = performance.now();
     let lastTime = -1;
     let finished = false;
+    const cur = this.current;
+    const seq = this.seq;
+    // 終わった・差し替わった、または別のスライドへの移動が始まった（読み込み中でまだ表示されていない）動画は、
+    // もうスライドショーを動かさない（終わっても次へ進まない、止まっても再生し直さない）
+    const stale = () => finished || this.current !== cur || this.seq !== seq;
     const finish = () => {
-      if (finished || this.current !== cur) return;
+      if (stale()) return;
       finished = true;
       this.next();
     };
-    const cur = this.current;
     const onTime = () => {
       const dur = Math.min(Number.isFinite(video.duration) ? video.duration : Infinity, maxSec);
       if (Number.isFinite(dur) && dur > 0) this._setProgress(video.currentTime / dur);
@@ -739,7 +772,7 @@ export class Player extends EventTarget {
     const onEnded = () => finish();
     // アプリ以外（メディアキー、ヘッドホンのボタンや取り外し、OS など）が動画を止めた・動かしたら、スライドショーも合わせる。
     // アプリ自身が止めるときは先に playing を変える（または別のスライドに替える）ので、ここでは何もしない
-    const external = () => !finished && this.current === cur && !video.ended && !document.hidden;
+    const external = () => !stale() && !video.ended && !document.hidden;
     const onPause = () => {
       if (external() && this.playing && video.paused) this.pause();
     };
@@ -747,7 +780,7 @@ export class Player extends EventTarget {
       if (external() && !this.playing && !video.paused) this.play();
     };
     const onError = () => {
-      if (finished || this.current !== cur) return;
+      if (stale()) return;
       finished = true;
       // 読み込み前のエラー（形式が未対応など）は代わりのスライドへ、再生途中のエラーは次へ
       if (!sawFrame) this._replaceWithFallback(cur, new Error(`media-error-${video.error?.code || 0}`));
@@ -756,7 +789,7 @@ export class Player extends EventTarget {
     let sawFrame = !!prepared.ready;
     const onLoaded = () => {
       sawFrame = true;
-      if (!video.videoWidth && !finished && this.current === cur) {
+      if (!video.videoWidth && !stale()) {
         finished = true;
         this._replaceWithFallback(cur, new Error('no-video-track'));
       }
@@ -777,7 +810,7 @@ export class Player extends EventTarget {
     let pausedSince = 0;
     let retried = false;
     const watchdog = setInterval(() => {
-      if (finished || this.current !== cur) return;
+      if (stale()) return;
       const now = performance.now();
       if (!this.playing || document.hidden) {
         lastProgressAt = now;
@@ -823,14 +856,19 @@ export class Player extends EventTarget {
     const p = video.play();
     if (p && p.catch) {
       p.catch((err) => {
-        if (finished || this.current !== cur) return;
+        if (stale()) return;
         if (err && err.name === 'NotAllowedError' && !video.muted) {
           // 音声付き自動再生がブロックされた → ミュートで再生
           video.muted = true;
           this.audioUnlocked = false;
           this._syncMuteButton();
           toast('自動再生の制限のため音声をミュートしました。画面をタップ（クリック）すると音声が出ます。', { timeout: 6000 });
-          video.play().catch(() => (sawFrame ? finish() : onError()));
+          video.play().catch((err2) => {
+            // 一時停止（pause() で AbortError になる）や別のスライドへの移動は失敗ではない
+            if (stale() || !this.playing || (err2 && err2.name === 'AbortError')) return;
+            if (sawFrame) finish();
+            else onError();
+          });
         } else if (err && err.name !== 'AbortError') {
           if (sawFrame) finish();
           else onError();
@@ -920,6 +958,7 @@ export class Player extends EventTarget {
             this._syncPlayButton();
             this._requestWakeLock();
             this.goTo(0);
+            this._showHud(); // おわりのカードで固定していた操作パネルを、また自動で隠す
           } }, ['もう一度見る']),
           h('button', { type: 'button', class: 'btn btn-ghost', onclick: (e) => {
             e.stopPropagation();
@@ -1160,7 +1199,8 @@ export class Player extends EventTarget {
     const muted = this.getSettings().videoMuted || !this.audioUnlocked;
     if (v.muted === muted) return;
     v.muted = muted;
-    if (!muted && this.playing) this._playVideo(v);
+    // 別のスライドへ移る途中なら、出ていく動画は止めたままにする
+    if (!muted && this.playing && !this._navigating()) this._playVideo(v);
   }
 
   /** 動画を再生する。音声付きの再生が拒否されたら（Safari など）ミュートにして再生し直す */
@@ -1217,7 +1257,7 @@ export class Player extends EventTarget {
     const target = e.target && e.target.closest ? e.target : null;
     if (target && target.closest('input, textarea, select, [contenteditable="true"]')) return;
     if (e.altKey || e.ctrlKey || e.metaKey) return;
-    if (this.drivePlayer || document.querySelector('.overlay:not([hidden]), .drive-player')) return;
+    if (this._modalOpen()) return;
     // フォーカスのある（表示されている）ボタンやリンクは Space / Enter でそのまま押せるようにする
     const control = (e.key === ' ' || e.key === 'Enter') && target ? target.closest('button, a, summary, [role="button"]') : null;
     if (control && control.getClientRects().length) {
@@ -1290,15 +1330,26 @@ export class Player extends EventTarget {
     }
   }
 
-  /** メディアキーやヘッドホンのボタンでスライドショーを操作する（ブラウザに動画だけを止めさせない） */
+  /** スライドショーの上にダイアログ（一覧、再ログイン、ドライブのプレーヤーなど）が開いているか */
+  _modalOpen() {
+    return !!(this.drivePlayer || document.querySelector('.overlay:not([hidden]), .drive-player'));
+  }
+
+  /**
+   * メディアキーやヘッドホンのボタンでスライドショーを操作する（ブラウザに動画だけを止めさせない）。
+   * キー操作と同じく、ダイアログが開いている間は再生・移動しない（再開するかはダイアログを閉じるときに決める）
+   */
   _setMediaSession(on) {
     const ms = navigator.mediaSession;
     if (!ms || typeof ms.setActionHandler !== 'function') return;
+    const unlessModal = (fn) => () => {
+      if (!this._modalOpen()) fn();
+    };
     const handlers = {
-      play: () => this.play(),
+      play: unlessModal(() => this.play()),
       pause: () => this.pause(),
-      nexttrack: () => this.next(),
-      previoustrack: () => this.prev(),
+      nexttrack: unlessModal(() => this.next()),
+      previoustrack: unlessModal(() => this.prev()),
     };
     for (const [action, fn] of Object.entries(handlers)) {
       try {

@@ -27,6 +27,8 @@ export const DEFAULTS = Object.freeze({
   imageQuality: 'original', // 'original' | 'fast'
   preciseTimes: true, // 写真の EXIF をファイルから直接読んで撮影時刻を補正する
   cameraOffsets: {}, // { [フォルダ ID]: { [補正グループ名]: 分 } }
+  // 以前の版で保存した（グループの分け方が今と違う）補正。最初にそのフォルダを開いたときに今のグループに移す
+  legacyCameraOffsets: {}, // { [フォルダ ID]: { [以前のグループ名]: 分 } }
 });
 
 const MAX_OFFSET_MINUTES = 48 * 60;
@@ -34,6 +36,8 @@ const MAX_OFFSET_FOLDERS = 50;
 const MAX_OFFSET_GROUPS = 100;
 const MAX_LABEL_LENGTH = 200;
 const FOLDER_ID_RE = /^[-\w]{1,200}$/;
+/** 共有リンクの fix=* : リンクの fix がそのフォルダの補正のすべて */
+const FIX_COMPLETE = '*';
 
 const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 const isPlainObject = (v) => !!v && typeof v === 'object' && !Array.isArray(v);
@@ -86,6 +90,21 @@ export function offsetsForFolder(settings, folderId) {
   return sanitizeGroupOffsets(all[folderId]);
 }
 
+/** このフォルダの、以前の版で保存した補正 { [以前のグループ名]: 分 }（catalog.migrateLegacyOffsets に渡す） */
+export function legacyOffsetsForFolder(settings, folderId) {
+  const all = settings && settings.legacyCameraOffsets;
+  if (!isPlainObject(all) || !validFolderId(folderId) || !hasOwn(all, folderId)) return {};
+  return sanitizeGroupOffsets(all[folderId]);
+}
+
+/** このフォルダの、以前の版で保存した補正を消した新しい設定を返す（今のグループに移し終えたとき） */
+export function withoutLegacyOffsets(settings, folderId) {
+  const base = settings || {};
+  const all = sanitizeFolderOffsets(base.legacyCameraOffsets);
+  if (validFolderId(folderId)) delete all[folderId];
+  return { ...base, legacyCameraOffsets: all };
+}
+
 /** このフォルダの補正を offsets に置き換えた新しい設定を返す（空ならフォルダごと消す。元の設定は変えない） */
 export function withFolderOffsets(settings, folderId, offsets) {
   const base = settings || {};
@@ -136,6 +155,7 @@ export function sanitize(raw) {
   out.imageQuality = s.imageQuality === 'fast' ? 'fast' : 'original';
   out.preciseTimes = bool(s.preciseTimes, DEFAULTS.preciseTimes);
   out.cameraOffsets = sanitizeFolderOffsets(s.cameraOffsets);
+  out.legacyCameraOffsets = sanitizeFolderOffsets(s.legacyCameraOffsets);
   return out;
 }
 
@@ -151,6 +171,8 @@ function readStored() {
 
 /**
  * 以前の版で保存した補正（フォルダ別でない { グループ名: 分 }）を、そのとき保存されていたフォルダの分に移す。
+ * 以前とグループの分け方が変わったファイル（機種名が読めるようになった動画など）にも同じ補正がかかるよう、
+ * 元の値は legacyCameraOffsets にも残す（アプリがそのフォルダを開いたときに今のグループに移す）。
  * フォルダが分からなければ旧形式の分は捨てる
  */
 export function migrateStoredOffsets(stored, fallbackFolder = '') {
@@ -163,6 +185,9 @@ export function migrateStoredOffsets(stored, fallbackFolder = '') {
   if (folderId && validFolderId(folderId)) {
     // 新しい形式で保存済みの値を優先し、旧形式の値は足りない分だけ補う
     nested[folderId] = { ...Object.fromEntries(flat), ...(isPlainObject(nested[folderId]) ? nested[folderId] : {}) };
+    const legacy = isPlainObject(stored.legacyCameraOffsets) ? { ...stored.legacyCameraOffsets } : {};
+    legacy[folderId] = Object.fromEntries(flat);
+    return { ...stored, cameraOffsets: nested, legacyCameraOffsets: legacy };
   }
   return { ...stored, cameraOffsets: nested };
 }
@@ -207,19 +232,26 @@ export function settingsFromUrl(search) {
   // API キーだけが指定された共有リンクは API キーモード
   if (o.apiKey && !o.authMode) o.authMode = 'apikey';
   // カメラ別補正: fix=<分>:<グループ名>（複数可）。URL のフォルダの分として読む。
-  // 0 も残す（loadSettings で保存済みの補正を打ち消せるように）
+  // 0 も残す（loadSettings で保存済みの補正を打ち消せるように）。
+  // fix=* があれば、このリンクの fix がそのフォルダの補正のすべて（保存済みの補正を置き換える。fix がなければ補正なし）
   const folderId = parseFolderInput(o.folder || '')?.id;
   if (folderId && validFolderId(folderId)) {
     const groups = {};
     let n = 0;
+    let complete = false;
     for (const v of p.getAll('fix')) {
+      if (v.trim() === FIX_COMPLETE) {
+        complete = true;
+        continue;
+      }
       const m = /^\s*([+-]?\d{1,6})\s*:([\s\S]+)$/.exec(v);
       const label = m ? m[2].trim() : '';
       if (!label || label.length > MAX_LABEL_LENGTH || label === '__proto__') continue;
       if (!hasOwn(groups, label) && n++ >= MAX_OFFSET_GROUPS) break;
       groups[label] = toOffsetMinutes(m[1]);
     }
-    if (n) o.cameraOffsets = { [folderId]: groups };
+    if (n || complete) o.cameraOffsets = { [folderId]: groups };
+    if (complete) o.replaceCameraOffsets = true;
   }
   return o;
 }
@@ -242,14 +274,18 @@ export function loadSettings(deployConfig = {}, search = '') {
   const fromUrl = settingsFromUrl(search);
   const merged = { ...fromDeploy, ...stored, ...fromUrl };
   if (fromUrl.cameraOffsets) {
-    // URL の補正はそのフォルダの保存済みの補正に上書きでまとめる（他のフォルダはそのまま）
+    // URL の補正はそのフォルダの保存済みの補正に上書きでまとめる（他のフォルダはそのまま）。
+    // fix=*（アプリが作る共有リンク）ならそのフォルダの補正を置き換える
     const all = sanitizeFolderOffsets(stored && stored.cameraOffsets);
+    const legacy = sanitizeFolderOffsets(stored && stored.legacyCameraOffsets);
     for (const [fid, groups] of Object.entries(fromUrl.cameraOffsets)) {
-      const prev = hasOwn(all, fid) ? all[fid] : {};
+      const prev = hasOwn(all, fid) && !fromUrl.replaceCameraOffsets ? all[fid] : {};
       delete all[fid];
       all[fid] = { ...prev, ...groups };
+      if (fromUrl.replaceCameraOffsets) delete legacy[fid];
     }
     merged.cameraOffsets = all;
+    merged.legacyCameraOffsets = legacy;
   }
   return sanitize(merged);
 }
@@ -269,12 +305,14 @@ export function buildShareUrl(baseUrl, settings) {
   }
   if (settings.timeZone !== DEFAULTS.timeZone) u.searchParams.set('tz', settings.timeZone);
   if (settings.title) u.searchParams.set('title', settings.title);
-  // このフォルダのカメラ別補正（分を先に書くのでグループ名に ':' があってもよい）
+  // このフォルダのカメラ別補正（分を先に書くのでグループ名に ':' があってもよい）。
+  // fix=* で、これがこのフォルダの補正のすべてであることを示す（開いた側の古い補正を残さない。補正がなくても付ける）
   const folderId = parseFolderInput(settings.folder || '')?.id;
-  if (folderId) {
+  if (folderId && validFolderId(folderId)) {
     for (const [group, minutes] of Object.entries(offsetsForFolder(settings, folderId))) {
       u.searchParams.append('fix', `${minutes}:${group}`);
     }
+    u.searchParams.append('fix', FIX_COMPLETE);
   }
   return u.toString();
 }

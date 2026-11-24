@@ -180,7 +180,9 @@ const MAX_SMALL_BOX = 1024 * 1024; // meta / udta / keys 等として読み込�
 
 /**
  * MP4 / MOV から撮影日時を取得する。
- * @returns {Promise<null|{epoch:number, source:'mp4-apple'|'mp4-day'|'mp4-mvhd', offsetMinutes?:number|null, make?:string, model?:string, mvhdEpoch?:number|null}>}
+ * @returns {Promise<null|{epoch:number, source:'mp4-apple'|'mp4-day'|'mp4-mvhd', offsetMinutes?:number|null, make?:string, model?:string, legacyLabel?:boolean, mvhdEpoch?:number|null}>}
+ *   legacyLabel: 機種名を以前の版も読んでいたキー（Apple の mdta、©mak / ©mod）から読めたか。
+ *   以前の版で保存した時刻補正を今のグループに移すときに、そのファイルの以前のグループを決めるのに使う
  */
 export async function readMp4CreationTime(reader) {
   const size = reader.size;
@@ -194,7 +196,7 @@ export async function readMp4CreationTime(reader) {
 
   const children = await listBoxes(reader, moov.start + moov.headerSize, moov.end, 256);
   let mvhdEpoch = null;
-  const found = { apple: null, day: null, make: null, model: null };
+  const found = { apple: null, day: null, make: null, model: null, legacyLabel: false };
 
   for (const box of children) {
     if (box.type === 'mvhd') {
@@ -225,7 +227,7 @@ export async function readMp4CreationTime(reader) {
     }
   }
 
-  const result = { make: found.make || undefined, model: found.model || undefined, mvhdEpoch };
+  const result = { make: found.make || undefined, model: found.model || undefined, legacyLabel: found.legacyLabel, mvhdEpoch };
   const apple = found.apple && parseIsoDateTime(found.apple);
   if (apple && apple.epoch != null) {
     return { ...result, epoch: apple.epoch, source: 'mp4-apple', offsetMinutes: apple.offsetMinutes };
@@ -317,8 +319,12 @@ function parseIlst(b, start, end, keys, found) {
   }
 }
 
+// 以前の版も機種名を読んでいたキー
+const LEGACY_LABEL_KEYS = new Set(['com.apple.quicktime.make', '©mak', 'com.apple.quicktime.model', '©mod']);
+
 function assignMeta(name, value, found) {
   if (!name || !value) return;
+  if (LEGACY_LABEL_KEYS.has(name)) found.legacyLabel = true;
   switch (name) {
     case 'com.apple.quicktime.creationdate':
       found.apple = found.apple || value;
@@ -330,12 +336,14 @@ function assignMeta(name, value, found) {
     case 'com.apple.quicktime.make':
     case 'com.android.manufacturer':
     case '©mak':
+    case 'CMT1.make':
       found.make = found.make || value;
       break;
     case 'com.apple.quicktime.model':
     case 'com.android.model':
     case '©mod':
     case 'CNMN':
+    case 'CMT1.model':
       found.model = found.model || value;
       break;
     default:
@@ -386,8 +394,8 @@ function parseCanonUuid(b, start, end, found) {
     if (fourcc(b, p + 4) === 'CMT1') {
       const ifd0 = parseTiffExif(b.subarray(p + 8, p + size));
       if (ifd0) {
-        assignMeta('©mak', ifd0.make, found);
-        assignMeta('©mod', ifd0.model, found);
+        assignMeta('CMT1.make', ifd0.make, found);
+        assignMeta('CMT1.model', ifd0.model, found);
       }
       break;
     }
@@ -699,6 +707,7 @@ export async function extractCaptureInfo(reader, mimeType) {
       offsetMinutes: r.offsetMinutes ?? null,
       make: r.make,
       model: r.model,
+      legacyLabel: r.legacyLabel,
     };
   }
   let exif = null;

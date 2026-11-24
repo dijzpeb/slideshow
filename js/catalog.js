@@ -259,6 +259,48 @@ export function compareItems(a, b) {
   return a.id < b.id ? -1 : a.id > b.id ? 1 : 0;
 }
 
+/**
+ * 以前の版（補正をフォルダ別に保存する前）の補正グループ名。以前は機種名（動画は Apple の mdta・©mak / ©mod の
+ * キーから読めたものだけ）か「機種不明」で、ファイル名からの推定・「（動画）」「（タイムゾーン記録あり）」の区別はなかった
+ */
+export function legacyCameraGroup(file, extracted, kind) {
+  const im = file.imageMediaMetadata || {};
+  let label = cameraLabel(im.cameraMake, im.cameraModel);
+  if (!label && extracted) {
+    // legacyLabel のない解析結果（この判定を入れる前のキャッシュ）は、Apple の機種名だけを以前も読めたとみなす
+    const readBefore = kind !== 'video' || (extracted.legacyLabel ?? /^apple$/i.test(cleanStr(extracted.make)));
+    if (readBefore) label = cameraLabel(extracted.make, extracted.model);
+  }
+  if (label) return label;
+  return kind === 'video' ? UNKNOWN_VIDEO_GROUP : UNKNOWN_PHOTO_GROUP;
+}
+
+/**
+ * 以前の版で保存した補正 legacyOffsets（{ 以前のグループ名: 分 }）を今のグループの補正に移す。
+ * 今のグループに補正（cameraOffsets）がなく、以前のグループに補正があったファイルについて、
+ * { 今のグループ名: 分 } を返す（グループ名が変わっても、以前と同じファイルに同じ補正がかかるように）。
+ * 「（タイムゾーン記録あり）」のグループには移さない（現地時刻として読んだ時刻向けの補正はかけない）
+ */
+export function migrateLegacyOffsets(files, extractedById, { timeZone, cameraOffsets, legacyOffsets } = {}) {
+  const get = (id) => (extractedById instanceof Map ? extractedById.get(id) : extractedById?.[id]) || null;
+  const own = cameraOffsets && typeof cameraOffsets === 'object' ? cameraOffsets : {};
+  const legacy = legacyOffsets && typeof legacyOffsets === 'object' ? legacyOffsets : {};
+  const hasOwn = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
+  const out = {};
+  for (const f of files) {
+    const kind = mediaKind(normalizeMimeType(f.mimeType, f.name), f.name);
+    if (!kind) continue;
+    const ex = get(f.id);
+    const { epoch, source } = resolveCaptureTime(f, ex, timeZone);
+    const group = correctionGroup(f, ex, kind, source, { epoch, timeZone });
+    if (group.endsWith(ZONED_GROUP_SUFFIX) || hasOwn(own, group) || hasOwn(out, group)) continue;
+    const old = legacyCameraGroup(f, ex, kind);
+    const m = hasOwn(legacy, old) ? Math.round(Number(legacy[old])) || 0 : 0;
+    if (m) out[group] = m;
+  }
+  return out;
+}
+
 /** カメラグループごとの件数（時刻補正 UI 用） */
 export function summarizeGroups(items) {
   const m = new Map();
