@@ -235,12 +235,12 @@ function parseRange(header, size) {
   return { start, end };
 }
 
-/** 写真・動画・音声の Content-Type だけを通す（SVG は不可）。それ以外は null */
+/** 写真・動画・音声の Content-Type だけを通す（SVG と XML 系（+xml）は不可）。それ以外は null */
 function mediaType(ct) {
   const t = String(ct || '').split(';')[0].trim().toLowerCase();
   // QuickTime (.mov) の H.264 動画は MP4 として扱えば Chrome / Firefox でも再生できることが多い
   if (t === 'video/quicktime') return 'video/mp4';
-  if (!/^(image|video|audio)\/[a-z0-9][a-z0-9.+-]*$/.test(t) || t === 'image/svg+xml') return null;
+  if (!/^(image|video|audio)\/[a-z0-9][a-z0-9.+-]*$/.test(t) || t.endsWith('+xml') || t.includes('svg')) return null;
   return t;
 }
 

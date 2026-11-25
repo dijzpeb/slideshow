@@ -2,7 +2,7 @@
 // scenario 3 (background EXIF refinement).
 import { test, before, after } from 'node:test';
 import {
-  openSuite, assert, assertOrder, expectedFor, mediaRequests, listRequests, assertNoPageErrors, TEST_KEY,
+  openSuite, assert, assertOrder, expectedFor, mediaRequests, listRequests, assertNoPageErrors, TEST_KEY, TRIP_TZ, META_CACHE_KEY,
 } from './lib.mjs';
 
 let suite;
@@ -14,7 +14,7 @@ after(async () => {
 });
 
 const ROOT_PARAMS = { folder: 'folder_root', key: TEST_KEY, mode: 'apikey', interval: 1, autostart: 1 };
-const dayKeyHelsinki = (iso) => new Intl.DateTimeFormat('en-CA', { timeZone: 'Europe/Helsinki' }).format(new Date(iso));
+const dayKeyTrip = (iso) => new Intl.DateTimeFormat('en-CA', { timeZone: TRIP_TZ }).format(new Date(iso));
 
 test('1. API-key mode, folder_root: chronological order, exclusions, shortcuts, pagination, title & day cards', { timeout: 90000 }, (t) => suite.wrap('01-catalog-order', async () => {
   await suite.admin.reset();
@@ -34,19 +34,19 @@ test('1. API-key mode, folder_root: chronological order, exclusions, shortcuts, 
   const src = Object.fromEntries(items.map((i) => [i.id, i.timeSource]));
   assert.equal(src.vid_tram, 'mp4-mvhd', 'vid_tram (moov at end) read from mvhd');
   assert.equal(src.vid_harbour_ferry, 'mp4-mvhd');
-  assert.equal(src.vid_reindeer_mov, 'mp4-apple', 'MOV uses com.apple.quicktime.creationdate');
-  assert.equal(src.vid_pxl_husky, 'filename', 'Pixel filename (UTC)');
+  assert.equal(src.vid_deer_mov, 'mp4-apple', 'MOV uses com.apple.quicktime.creationdate');
+  assert.equal(src.vid_pxl_bike, 'filename', 'Pixel filename (UTC)');
   assert.equal(src.img_screenshot, 'filename');
-  assert.equal(src.img_sauna, 'drive-times');
+  assert.equal(src.img_cabin, 'drive-times');
   assert.match(src.img_sony_offset, /^exif(-offset)?$/);
 
   // --- exclusions and shortcut resolution ---------------------------------------------------
-  for (const id of ['img_trashed', 'txt_notes', 'doc_itinerary', 'sc_img_other', 'sc_folder_extra', 'img_hidden_rovaniemi', 'img_hidden_lapland',
-    'folder_day1', 'folder_aurora', 'img_private_1', 'img_reskey_1', 'big_001']) {
+  for (const id of ['img_trashed', 'txt_notes', 'doc_itinerary', 'sc_img_other', 'sc_folder_extra', 'img_hidden_lunch', 'img_hidden_berries',
+    'folder_day1', 'folder_night_sky', 'img_private_1', 'img_reskey_1', 'big_001']) {
     assert.ok(!ids.includes(id), `${id} must not be in the slideshow`);
   }
-  assert.ok(ids.includes('img_other_kauppatori'), 'file shortcut target (in a non-public folder) resolved');
-  assert.ok(ids.includes('img_extra_porvoo'), 'folder shortcut followed');
+  assert.ok(ids.includes('img_other_market'), 'file shortcut target (in a non-public folder) resolved');
+  assert.ok(ids.includes('img_extra_old_town'), 'folder shortcut followed');
   assert.equal(new Set(ids).size, ids.length, 'no duplicates');
 
   // --- pagination (maxPageSize 4) -----------------------------------------------------------
@@ -55,7 +55,7 @@ test('1. API-key mode, folder_root: chronological order, exclusions, shortcuts, 
   const paged = lists.filter((e) => e.query.pageToken);
   assert.ok(paged.length >= 3, `expected follow-up page requests with pageToken, got ${paged.length}`);
   for (const e of lists) assert.equal(e.status, 200, `list request failed: ${JSON.stringify(e.query)}`);
-  for (const folder of ['folder_root', 'folder_day1', 'folder_day2', 'folder_day3', 'folder_aurora', 'folder_day4', 'folder_extra']) {
+  for (const folder of ['folder_root', 'folder_day1', 'folder_day2', 'folder_day3', 'folder_night_sky', 'folder_day4', 'folder_extra']) {
     assert.ok(lists.some((e) => e.query.q && e.query.q.includes(`'${folder}' in parents`)), `${folder} was listed`);
   }
   assert.ok(lists.every((e) => /trashed\s*=\s*false/.test(e.query.q)), 'list queries exclude trash');
@@ -84,7 +84,7 @@ test('1. API-key mode, folder_root: chronological order, exclusions, shortcuts, 
   const daySlides = await app.page.evaluate(() => window.__slideshow.player.slides.filter((s) => s.type === 'day').map((s) => ({ day: s.day, n: s.dayNumber, count: s.count })));
   const expDays = new Map();
   for (const id of expected) {
-    const k = dayKeyHelsinki(suite.byId[id]._test.expected.appTimeUtcDefault);
+    const k = dayKeyTrip(suite.byId[id]._test.expected.appTimeUtcDefault);
     expDays.set(k, (expDays.get(k) || 0) + 1);
   }
   assert.deepEqual(daySlides, [...expDays.entries()].map(([day, count], i) => ({ day, n: i + 1, count })), 'day cards 1日目..4日目 with item counts');
@@ -93,7 +93,7 @@ test('1. API-key mode, folder_root: chronological order, exclusions, shortcuts, 
   const expKeys = ['title'];
   let lastDay = null;
   for (const id of expected) {
-    const d = dayKeyHelsinki(suite.byId[id]._test.expected.appTimeUtcDefault);
+    const d = dayKeyTrip(suite.byId[id]._test.expected.appTimeUtcDefault);
     if (d !== lastDay) expKeys.push(`day:${d}`);
     lastDay = d;
     expKeys.push(`media:${id}`);
@@ -114,7 +114,7 @@ test('1. API-key mode, folder_root: chronological order, exclusions, shortcuts, 
     caption: document.querySelector('#player .caption').textContent,
     counter: document.querySelector('#player .counter').textContent,
   }));
-  assert.match(hud.caption, /7月12日（土） 12:05/, 'caption shows the Helsinki wall-clock time');
+  assert.match(hud.caption, /7月12日（土） 12:05/, 'caption shows the trip-zone wall-clock time');
   assert.match(hud.caption, /1日目/);
   assert.equal(hud.counter, `1 / ${expected.length}`);
   assertNoPageErrors(app);
@@ -127,8 +127,8 @@ test('1b. metadata cache: a reload reuses the parsed capture times (no Range rea
   await app.waitForPlayer();
   // wait for the background refinement to finish (its results are cached too)
   await app.page.waitForFunction(() => window.__slideshow.items.find((i) => i.id === 'img_airport')?.timeSource === 'exif-offset', null, { timeout: 30000 });
-  const cached = await app.page.evaluate(() => Object.keys(JSON.parse(localStorage.getItem('finland-slideshow.meta.v1') || '{}')));
-  for (const id of ['vid_tram', 'vid_reindeer_mov', 'img_sony_offset', 'img_senate_square']) assert.ok(cached.includes(id), `${id} cached`);
+  const cached = await app.page.evaluate((k) => Object.keys(JSON.parse(localStorage.getItem(k) || '{}')), META_CACHE_KEY);
+  for (const id of ['vid_tram', 'vid_deer_mov', 'img_sony_offset', 'img_city_square']) assert.ok(cached.includes(id), `${id} cached`);
   const ids1 = await app.itemIds();
   await suite.admin.clearLog();
   await app.page.reload();
@@ -136,7 +136,7 @@ test('1b. metadata cache: a reload reuses the parsed capture times (no Range rea
   const ids2 = await app.itemIds();
   assert.deepEqual(ids2, ids1);
   const items = await app.items();
-  assert.equal(items.find((i) => i.id === 'img_senate_square').timeSource, 'exif-offset', 'refined result applied immediately from the cache');
+  assert.equal(items.find((i) => i.id === 'img_city_square').timeSource, 'exif-offset', 'refined result applied immediately from the cache');
   const ranged = (await suite.admin.log()).filter((e) => e.range && /^bytes=0-/.test(e.range) && e.origin && !e.path.includes('vid_'));
   assert.deepEqual(ranged.map((e) => e.path), [], 'no EXIF Range reads on the second load');
   assertNoPageErrors(app);
@@ -215,14 +215,14 @@ test('3b. refinement fixes Drive times when the trip time zone setting is wrong 
   await app.page.waitForFunction(() => window.__slideshow.player && window.__slideshow.player.slides.length > 0);
   let items = Object.fromEntries((await app.items()).map((i) => [i.id, i]));
   // before refinement: Drive wall clock "12:05" read as UTC
-  assert.equal(items.img_senate_square.iso, '2025-07-12T12:05:00.000Z', 'pre-refinement: Drive time interpreted in the (wrong) trip zone');
-  assert.equal(items.img_senate_square.timeSource, 'exif');
+  assert.equal(items.img_city_square.iso, '2025-07-12T12:05:00.000Z', 'pre-refinement: Drive time interpreted in the (wrong) trip zone');
+  assert.equal(items.img_city_square.timeSource, 'exif');
   assert.equal(items.img_market_square_canon.iso, '2025-07-12T20:10:00.000Z');
   // video times are absolute and unaffected by the trip zone
   assert.equal(items.vid_tram.iso, '2025-07-12T15:30:00.000Z');
   assert.ok(held > 0, 'refinement requests were issued');
   release();
-  await app.page.waitForFunction(() => window.__slideshow.items.find((i) => i.id === 'img_senate_square').timeSource === 'exif-offset', null, { timeout: 45000 });
+  await app.page.waitForFunction(() => window.__slideshow.items.find((i) => i.id === 'img_city_square').timeSource === 'exif-offset', null, { timeout: 45000 });
   const withOffset = Object.keys(items).filter((id) => suite.byId[id]._test.exif?.offsetTimeOriginal);
   assert.ok(withOffset.length >= 10, `photos with OffsetTimeOriginal: ${withOffset.length}`);
   await app.page.waitForFunction((ids) => ids.every((id) => window.__slideshow.items.find((i) => i.id === id)?.timeSource === 'exif-offset'), withOffset, { timeout: 45000 });

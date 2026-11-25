@@ -1,7 +1,7 @@
 // Unit tests of MediaLoader's photo cache: skipped photos stop downloading (AbortController per entry).
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { MediaLoader } from '../../js/loader.js';
+import { MediaLoader, setupServiceWorker, isOwnServiceWorker, appServiceWorkerUrl } from '../../js/loader.js';
 import { DriveClient } from '../../js/drive.js';
 
 // Minimal browser stand-ins: <img> that "loads" any URL, fetch() of the Drive API with a controllable delay.
@@ -225,4 +225,112 @@ test('loader: a photo whose modifiedTime changed replaces the old entry: its dow
   } finally {
     URL.revokeObjectURL = origRevoke;
   }
+});
+
+test('loader: a downloaded photo gets a safe Blob type (never the SVG / HTML type of the response)', async () => {
+  const orig = globalThis.fetch;
+  const types = { svg: 'image/svg+xml; charset=utf-8', html: 'text/html', jpg: 'image/jpeg; charset=binary', none: '', heic: 'image/heic', xml: 'image/x-test+xml' };
+  globalThis.fetch = async (url) => {
+    const id = decodeURIComponent(new URL(url).pathname.split('/').pop());
+    const headers = types[id] ? { 'content-type': types[id] } : {};
+    return new Response('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>', { status: 200, headers });
+  };
+  try {
+    const loader = new MediaLoader({
+      drive: new DriveClient({ apiBase: 'https://drive.test', mode: 'apikey', apiKey: 'K' }),
+      sw: null,
+      getSettings: () => ({ imageQuality: 'original' }),
+    });
+    const blobType = async (id, mimeType) => (await loader._fetchBlob({ id, name: id, mimeType })).type;
+    assert.equal(await blobType('svg', 'image/svg+xml'), 'application/octet-stream');
+    assert.equal(await blobType('svg', 'image/jpeg'), 'image/jpeg', 'the listed (raster) type, not the SVG response type');
+    assert.equal(await blobType('html', 'text/html'), 'application/octet-stream');
+    assert.equal(await blobType('xml', ''), 'application/octet-stream');
+    assert.equal(await blobType('jpg', 'image/jpeg'), 'image/jpeg');
+    assert.equal(await blobType('none', 'image/png'), 'image/png');
+    assert.equal(await blobType('heic', 'image/heic'), 'image/heic');
+    const b = await loader._fetchBlob({ id: 'jpg', name: 'a.jpg', mimeType: 'image/jpeg' });
+    assert.match(await b.text(), /^<svg/, 'the bytes are kept as they are');
+  } finally {
+    globalThis.fetch = orig;
+  }
+});
+
+test('loader: need-creds is answered only for the app\'s own Service Worker (not another same-origin worker)', async () => {
+  class FakeServiceWorker {
+    constructor(scriptURL) {
+      this.scriptURL = scriptURL;
+    }
+  }
+  let onMessage = null;
+  const saved = { window: globalThis.window, navigator: Object.getOwnPropertyDescriptor(globalThis, 'navigator'), location: globalThis.location, ServiceWorker: globalThis.ServiceWorker };
+  globalThis.window = { isSecureContext: true };
+  globalThis.location = { href: 'https://user.example.io/slideshow/?folder=F' };
+  globalThis.ServiceWorker = FakeServiceWorker;
+  Object.defineProperty(globalThis, 'navigator', {
+    configurable: true,
+    value: {
+      serviceWorker: {
+        addEventListener(type, fn) {
+          if (type === 'message') onMessage = fn;
+        },
+        register: () => new Promise(() => {}), // never settles: setupServiceWorker gives up after timeoutMs
+        ready: new Promise(() => {}),
+      },
+    },
+  });
+  try {
+    assert.equal(appServiceWorkerUrl(), 'https://user.example.io/slideshow/sw.js');
+    const asked = [];
+    const sw = await setupServiceWorker({ getCreds: async (force, failed) => (asked.push({ force, failed }), { apiBase: 'https://drive.test', token: 'secret' }), timeoutMs: 5 });
+    assert.equal(sw, null);
+    assert.equal(typeof onMessage, 'function');
+    const send = async (source, data) => {
+      const replies = [];
+      await onMessage({ data, source, ports: [{ postMessage: (m) => replies.push(m) }] });
+      return replies;
+    };
+    const own = new FakeServiceWorker('https://user.example.io/slideshow/sw.js');
+    const foreign = [
+      new FakeServiceWorker('https://user.example.io/other-app/sw.js'),
+      new FakeServiceWorker('https://user.example.io/sw.js'),
+      { scriptURL: 'https://user.example.io/slideshow/sw.js' }, // not a ServiceWorker (e.g. a window)
+      null,
+    ];
+    for (const src of foreign) {
+      assert.deepEqual(await send(src, { type: 'need-creds' }), [], `no answer to ${src && src.scriptURL}`);
+      assert.deepEqual(await send(src, { type: 'need-creds', force: true, failedToken: null }), [], 'force from a foreign worker is ignored');
+    }
+    assert.deepEqual(asked, [], 'getCreds is never called for a foreign worker (a forced call would drop the token)');
+    assert.deepEqual(await send(own, { type: 'need-creds' }), [{ type: 'creds', creds: { apiBase: 'https://drive.test', token: 'secret' } }]);
+    assert.deepEqual(asked, [{ force: false, failed: null }]);
+    assert.equal(isOwnServiceWorker(own), true);
+    assert.equal(isOwnServiceWorker(foreign[0]), false);
+  } finally {
+    globalThis.window = saved.window;
+    globalThis.location = saved.location;
+    globalThis.ServiceWorker = saved.ServiceWorker;
+    if (saved.navigator) Object.defineProperty(globalThis, 'navigator', saved.navigator);
+    else delete globalThis.navigator;
+  }
+});
+
+test('loader: a camera RAW photo uses the Drive thumbnail first (the original is not downloaded); JPEG uses the original', async (t) => {
+  const prevWindow = globalThis.window;
+  globalThis.window = { devicePixelRatio: 1, screen: { width: 1920, height: 1080 }, innerWidth: 1280, innerHeight: 720 };
+  t.after(() => {
+    globalThis.window = prevWindow;
+  });
+  const { loader, requests, finish } = setup();
+  const raw = { id: 'RAW1', name: 'DSC0001.ARW', mimeType: 'image/x-sony-arw', modifiedTime: '2025-01-01T00:00:00Z', thumbnailLink: 'https://lh3.test/raw1=s220' };
+  const r = await loader.loadImage(raw);
+  assert.equal(r.via, 'thumbnail');
+  assert.equal(requests.filter((q) => q.id === 'RAW1').length, 0, 'no download of the RAW original');
+  // a JPEG with a thumbnail link still loads the original
+  const jpg = { id: 'JPG1', name: 'a.jpg', mimeType: 'image/jpeg', modifiedTime: '2025-01-01T00:00:00Z', thumbnailLink: 'https://lh3.test/jpg1=s220' };
+  const p = loader.loadImage(jpg);
+  await tick();
+  finish('JPG1');
+  assert.equal((await p).via, 'original');
+  loader.clear();
 });

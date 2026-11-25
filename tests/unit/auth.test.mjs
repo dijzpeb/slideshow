@@ -104,3 +104,74 @@ test('auth: a token after a re-request resolves every caller; a token for each c
   assert.equal(s.pending, null);
   s.dispose();
 });
+
+test('auth: an expired token still counts as held (hasToken, so ログアウト is offered); signOut revokes and forgets it', async () => {
+  const popup = installGis();
+  const revoked = [];
+  window.google.accounts.oauth2.revoke = (t, cb) => {
+    revoked.push(t);
+    cb?.({});
+  };
+  const { OAuthSession } = await import('../../js/auth.js');
+  const s = new OAuthSession('cid3');
+  await s.init();
+  assert.equal(s.hasToken, false);
+  const p = s.request();
+  await sleep(10);
+  popup.grant('tok3');
+  await p;
+  assert.deepEqual([s.signedIn, s.hasToken], [true, true]);
+  s.tokenData.expiresAt = Date.now() - 1000; // expired while the page stayed open
+  assert.deepEqual([s.signedIn, s.hasToken], [false, true]);
+  let changes = 0;
+  s.addEventListener('change', () => changes++);
+  s.signOut();
+  assert.deepEqual([s.signedIn, s.hasToken, changes], [false, false, 1]);
+  assert.deepEqual(revoked, ['tok3']);
+  s.dispose();
+});
+
+test('auth: a token of this tab restored after it expired is still held (ログアウト can remove it); no expired event', async () => {
+  installGis();
+  const revoked = [];
+  window.google.accounts.oauth2.revoke = (t, cb) => {
+    revoked.push(t);
+    cb?.({});
+  };
+  const store = new Map();
+  const prev = globalThis.sessionStorage;
+  globalThis.sessionStorage = {
+    getItem: (k) => (store.has(k) ? store.get(k) : null),
+    setItem: (k, v) => store.set(k, String(v)),
+    removeItem: (k) => store.delete(k),
+  };
+  try {
+    const { OAuthSession } = await import('../../js/auth.js');
+    const key = 'photo-slideshow.token.v1';
+    // expired (the tab was reopened / reloaded after an hour)
+    store.set(key, JSON.stringify({ accessToken: 'old-tok', expiresAt: Date.now() - 60000, clientId: 'cid4' }));
+    const s = new OAuthSession('cid4');
+    let expired = 0;
+    s.addEventListener('expired', () => expired++);
+    assert.deepEqual([s.signedIn, s.hasToken, s.accessToken], [false, true, null]);
+    assert.equal(await s.getToken(), null, 'an expired token is never handed out');
+    await sleep(20);
+    assert.equal(expired, 0, 'no expired event for a token that was already expired when restored');
+    s.signOut();
+    assert.deepEqual([s.hasToken, store.has(key)], [false, false], 'signOut removes it from sessionStorage');
+    assert.deepEqual(revoked, ['old-tok']);
+    s.dispose();
+    // a token of another client stays unused
+    store.set(key, JSON.stringify({ accessToken: 'other', expiresAt: Date.now() + 3600000, clientId: 'cid-other' }));
+    const o = new OAuthSession('cid4');
+    assert.deepEqual([o.signedIn, o.hasToken], [false, false]);
+    o.dispose();
+    // a valid token is restored as before
+    store.set(key, JSON.stringify({ accessToken: 'good', expiresAt: Date.now() + 3600000, clientId: 'cid4' }));
+    const g = new OAuthSession('cid4');
+    assert.deepEqual([g.signedIn, g.accessToken], [true, 'good']);
+    g.dispose();
+  } finally {
+    globalThis.sessionStorage = prev;
+  }
+});

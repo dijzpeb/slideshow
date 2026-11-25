@@ -12,37 +12,39 @@ import {
   formatDateTimeJa,
   daysBetween,
   isValidTimeZone,
+  deviceTimeZone,
   formatOffset,
 } from '../../js/timeutil.js';
 
-const HEL = 'Europe/Helsinki';
+// UTC+2、夏時間 UTC+3（EU の規則: 3 月最終日曜 03:00→04:00、10 月最終日曜 04:00→03:00）
+const ZONE = 'Europe/Athens';
 
-test('tzOffsetMs: Helsinki summer is UTC+3, winter UTC+2', () => {
-  assert.equal(tzOffsetMs(Date.UTC(2025, 6, 12, 12), HEL), 3 * 3600e3);
-  assert.equal(tzOffsetMs(Date.UTC(2025, 0, 12, 12), HEL), 2 * 3600e3);
+test('tzOffsetMs: Europe/Athens summer is UTC+3, winter UTC+2', () => {
+  assert.equal(tzOffsetMs(Date.UTC(2025, 6, 12, 12), ZONE), 3 * 3600e3);
+  assert.equal(tzOffsetMs(Date.UTC(2025, 0, 12, 12), ZONE), 2 * 3600e3);
   assert.equal(tzOffsetMs(Date.UTC(2025, 6, 12, 12), 'Asia/Tokyo'), 9 * 3600e3);
   assert.equal(tzOffsetMs(Date.UTC(2025, 6, 12, 12), 'UTC'), 0);
 });
 
-test('wallClockToEpoch converts Helsinki wall clock to the right instant', () => {
+test('wallClockToEpoch converts a wall clock in the time zone to the right instant', () => {
   const w = { y: 2025, mo: 7, d: 12, h: 14, mi: 30, s: 0 };
-  assert.equal(new Date(wallClockToEpoch(w, HEL)).toISOString(), '2025-07-12T11:30:00.000Z');
+  assert.equal(new Date(wallClockToEpoch(w, ZONE)).toISOString(), '2025-07-12T11:30:00.000Z');
   const wWinter = { y: 2025, mo: 12, d: 24, h: 18, mi: 0, s: 0 };
-  assert.equal(new Date(wallClockToEpoch(wWinter, HEL)).toISOString(), '2025-12-24T16:00:00.000Z');
+  assert.equal(new Date(wallClockToEpoch(wWinter, ZONE)).toISOString(), '2025-12-24T16:00:00.000Z');
   assert.equal(new Date(wallClockToEpoch(w, 'Asia/Tokyo')).toISOString(), '2025-07-12T05:30:00.000Z');
-  assert.equal(new Date(wallClockToEpoch({ ...w, ms: 250 }, HEL)).toISOString(), '2025-07-12T11:30:00.250Z');
+  assert.equal(new Date(wallClockToEpoch({ ...w, ms: 250 }, ZONE)).toISOString(), '2025-07-12T11:30:00.250Z');
 });
 
-test('wallClockToEpoch handles DST transitions (Helsinki 2025-03-30 03:00→04:00, 2025-10-26 04:00→03:00)', () => {
+test('wallClockToEpoch handles DST transitions (Europe/Athens 2025-03-30 03:00→04:00, 2025-10-26 04:00→03:00)', () => {
   // 存在しない時刻 03:30 → 前のオフセット（UTC+2）で解釈 = 01:30Z
-  const gap = wallClockToEpoch({ y: 2025, mo: 3, d: 30, h: 3, mi: 30 }, HEL);
+  const gap = wallClockToEpoch({ y: 2025, mo: 3, d: 30, h: 3, mi: 30 }, ZONE);
   assert.ok([Date.UTC(2025, 2, 30, 1, 30), Date.UTC(2025, 2, 30, 0, 30)].includes(gap), new Date(gap).toISOString());
   // 重複する時刻 03:30 → 早い方（夏時間 UTC+3）= 00:30Z
-  const overlap = wallClockToEpoch({ y: 2025, mo: 10, d: 26, h: 3, mi: 30 }, HEL);
+  const overlap = wallClockToEpoch({ y: 2025, mo: 10, d: 26, h: 3, mi: 30 }, ZONE);
   assert.equal(new Date(overlap).toISOString(), '2025-10-26T00:30:00.000Z');
   // 前後の普通の時刻
-  assert.equal(new Date(wallClockToEpoch({ y: 2025, mo: 3, d: 30, h: 2, mi: 30 }, HEL)).toISOString(), '2025-03-30T00:30:00.000Z');
-  assert.equal(new Date(wallClockToEpoch({ y: 2025, mo: 3, d: 30, h: 4, mi: 30 }, HEL)).toISOString(), '2025-03-30T01:30:00.000Z');
+  assert.equal(new Date(wallClockToEpoch({ y: 2025, mo: 3, d: 30, h: 2, mi: 30 }, ZONE)).toISOString(), '2025-03-30T00:30:00.000Z');
+  assert.equal(new Date(wallClockToEpoch({ y: 2025, mo: 3, d: 30, h: 4, mi: 30 }, ZONE)).toISOString(), '2025-03-30T01:30:00.000Z');
 });
 
 test('parseExifDateTime', () => {
@@ -99,23 +101,51 @@ test('parseFilenameTime: common phone patterns', () => {
   const wa = parseFilenameTime('IMG-20250712-WA0003.jpg');
   assert.equal(wa.pattern, 'date-only');
   assert.equal(parseFilenameTime('IMG_1234.JPG'), null);
-  assert.equal(parseFilenameTime('sauna.jpg'), null);
+  assert.equal(parseFilenameTime('cabin.jpg'), null);
   assert.equal(parseFilenameTime('20251399_999999.jpg'), null);
 });
 
 test('dayKey / formatting', () => {
-  const t = Date.UTC(2025, 6, 12, 22, 30); // Helsinki 01:30 on 7/13
-  assert.equal(dayKey(t, HEL), '2025-07-13');
+  const t = Date.UTC(2025, 6, 12, 22, 30); // 01:30 on 7/13 in Europe/Athens (UTC+3)
+  assert.equal(dayKey(t, ZONE), '2025-07-13');
   assert.equal(dayKey(t, 'UTC'), '2025-07-12');
-  assert.equal(formatDateJa(t, HEL), '2025年7月13日（日）');
-  assert.equal(formatDateTimeJa(t, HEL), '7月13日（日） 01:30');
+  assert.equal(formatDateJa(t, ZONE), '2025年7月13日（日）');
+  assert.equal(formatDateTimeJa(t, ZONE), '7月13日（日） 01:30');
   assert.equal(daysBetween('2025-07-12', '2025-07-15'), 3);
   assert.equal(formatOffset(3 * 3600e3), 'UTC+3');
   assert.equal(formatOffset(5.5 * 3600e3), 'UTC+5:30');
 });
 
 test('isValidTimeZone', () => {
-  assert.equal(isValidTimeZone('Europe/Helsinki'), true);
+  assert.equal(isValidTimeZone('Europe/Paris'), true);
   assert.equal(isValidTimeZone('Mars/Olympus'), false);
   assert.equal(isValidTimeZone(''), false);
+});
+
+test('deviceTimeZone: the runtime\'s own time zone, UTC when it is missing or invalid', () => {
+  const own = Intl.DateTimeFormat().resolvedOptions().timeZone;
+  assert.equal(deviceTimeZone(), isValidTimeZone(own) ? own : 'UTC');
+  const proto = Intl.DateTimeFormat.prototype;
+  const orig = proto.resolvedOptions;
+  const withZone = (timeZone) => {
+    proto.resolvedOptions = function () {
+      return { ...orig.call(this), timeZone };
+    };
+    try {
+      return deviceTimeZone();
+    } finally {
+      proto.resolvedOptions = orig;
+    }
+  };
+  assert.equal(withZone('America/New_York'), 'America/New_York');
+  assert.equal(withZone(undefined), 'UTC');
+  assert.equal(withZone('Mars/Olympus'), 'UTC');
+  proto.resolvedOptions = () => {
+    throw new Error('not supported');
+  };
+  try {
+    assert.equal(deviceTimeZone(), 'UTC');
+  } finally {
+    proto.resolvedOptions = orig;
+  }
 });

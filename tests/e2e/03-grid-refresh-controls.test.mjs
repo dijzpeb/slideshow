@@ -2,7 +2,7 @@
 // refresh) and scenario 6 (keyboard shortcuts and HUD controls).
 import { test, before, after } from 'node:test';
 import {
-  openSuite, assert, assertOrder, expectedFor, assertNoPageErrors, colorNear, SETTINGS_KEY, TEST_KEY, sleep,
+  openSuite, assert, assertOrder, expectedFor, assertNoPageErrors, assertNoCspViolations, colorNear, SETTINGS_KEY, TEST_KEY, sleep,
 } from './lib.mjs';
 
 let suite;
@@ -46,7 +46,7 @@ test('4. per-camera time correction in the grid: Canon EOS R6 −6 h → expecte
   const groups = await app.page.$$eval('#time-fix-table .fix-row', (rows) => rows.map((r) => r.dataset.group));
   assert.ok(groups.includes('Canon EOS R6'), `camera groups: ${groups}`);
   const tzNote = await app.page.textContent('#time-fix-table p');
-  assert.match(tzNote, /Europe\/Helsinki（UTC\+3）/);
+  assert.match(tzNote, /Europe\/Athens（UTC\+3）/);
   const canonRow = app.page.locator('#time-fix-table .fix-row[data-group="Canon EOS R6"]');
   assert.match(await canonRow.textContent(), /写真 3/);
   await canonRow.locator('input').nth(0).fill('-6');
@@ -91,6 +91,7 @@ test('4. per-camera time correction in the grid: Canon EOS R6 −6 h → expecte
   const stored2 = await app.page.evaluate((k) => JSON.parse(localStorage.getItem(k)), SETTINGS_KEY);
   assert.deepEqual(stored2.cameraOffsets, {});
   assertNoPageErrors(app);
+  await assertNoCspViolations(app);
   await app.close();
 })(t));
 
@@ -98,7 +99,7 @@ test('5. manual refresh (今すぐ更新): newly revealed photos are inserted ch
   await suite.admin.reset();
   const app = await suite.newApp({ params: ROOT_PARAMS });
   await app.waitForPlayer();
-  await app.waitForSlide({ id: 'img_helsinki_cathedral' }, 20000);
+  await app.waitForSlide({ id: 'img_cathedral' }, 20000);
   await suite.admin.revealAll();
   await openGrid(app, 'key');
   const before = await app.current();
@@ -127,11 +128,11 @@ test('5. manual refresh (今すぐ更新): newly revealed photos are inserted ch
   assert.ok(!(await app.itemIds()).includes('img_lake'));
 
   // a revealed photo really displays (click its tile)
-  await app.page.click('#grid-body .tile[data-id="img_hidden_rovaniemi"]');
-  await app.waitForSlide({ id: 'img_hidden_rovaniemi' });
-  await app.page.waitForFunction(() => window.__slideLog.find((e) => e.id === 'img_hidden_rovaniemi')?.color);
-  const e = (await app.slideLog()).find((x) => x.id === 'img_hidden_rovaniemi');
-  assert.ok(colorNear(e.color, suite.byId.img_hidden_rovaniemi._test.bgColor), `colour ${e.color}`);
+  await app.page.click('#grid-body .tile[data-id="img_hidden_lunch"]');
+  await app.waitForSlide({ id: 'img_hidden_lunch' });
+  await app.page.waitForFunction(() => window.__slideLog.find((e) => e.id === 'img_hidden_lunch')?.color);
+  const e = (await app.slideLog()).find((x) => x.id === 'img_hidden_lunch');
+  assert.ok(colorNear(e.color, suite.byId.img_hidden_lunch._test.bgColor), `colour ${e.color}`);
   assertNoPageErrors(app);
   await app.close();
 })(t));
@@ -170,7 +171,7 @@ test('5b. automatic refresh (refresh interval from the URL) picks up revealed ph
   const app = await suite.newApp({ params: { ...ROOT_PARAMS, refresh: 0.05 } });
   await app.waitForPlayer();
   await suite.admin.revealAll();
-  await app.page.waitForFunction(() => window.__slideshow.items.some((i) => i.id === 'img_hidden_lapland'), null, { timeout: 20000 });
+  await app.page.waitForFunction(() => window.__slideshow.items.some((i) => i.id === 'img_hidden_berries'), null, { timeout: 20000 });
   const ids = await app.itemIds();
   assertOrder(ids, expectedFor(suite.manifest, 'reveal', ids), 'order after the automatic refresh');
   await app.page.waitForFunction(() => window.__toasts.some((x) => x.text === 'フォルダが更新されました（2 件追加）'), null, { timeout: 5000 });

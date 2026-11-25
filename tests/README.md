@@ -3,7 +3,9 @@
 ```
 tests/
   unit/                     unit tests of the app modules (node --test, owned by the app; auth.test.mjs stubs
-                            Google Identity Services with one shared popup, like the real library)
+                            Google Identity Services with one shared popup, like the real library;
+                            csp.test.mjs checks index.html's Content-Security-Policy and scripts/dev-csp.mjs;
+                            write-config.test.mjs checks scripts/write-config.mjs, the deploy-time config.js)
   fixtures/generate.py      builds the media fixtures + manifest.json (the test oracle)
   fixtures/out/             generated output (git-ignored)
   mock-drive/server.mjs     mock of the Google Drive API v3 (node built-ins only)
@@ -11,6 +13,7 @@ tests/
   e2e/smoke-mock.mjs        smoke test of the mock API (fetch only, no browser)
   e2e/smoke-browser.mjs     smoke test of the mock from real Chromium (CORS, <img>, <video>)
   e2e/blank.html            empty same-origin page used by smoke-browser.mjs
+  e2e/foreign-sw.js         another same-origin Service Worker (not the app's sw.js), used by 11-security S5
   e2e/lib.mjs               shared helpers of the Playwright E2E suite (recorder, GIS stub, …)
   e2e/*.test.mjs            the Playwright E2E suite (section 4)
   e2e/out/                  screenshots written by the suite (git-ignored)
@@ -31,6 +34,14 @@ node tests/e2e/harness.mjs --app-port 8080 --drive-port 8787 [--max-page-size 4]
 The app honours `?apiBase=` only when it is opened on localhost/127.0.0.1 and the target is
 local (see `resolveApiBase` in `js/settings.js`). Alternatively `routeGoogleApis()` (below)
 redirects the real `https://www.googleapis.com/drive/...` URLs to the mock inside Playwright.
+
+**Content-Security-Policy.** `index.html` carries the production CSP in a `<meta>` (only the app's own
+origin and the Google endpoints; no localhost). The test static server (`startStaticServer`) and the dev
+server (`npm start`, `scripts/serve.mjs`) serve HTML with that policy extended — `connect-src`, `img-src`,
+`media-src` only — by the loopback origins of the mock (`cspOrigins`) and of the page's own `?apiBase=`
+(`scripts/dev-csp.mjs`; non-loopback origins are never added). So the whole suite runs under the real CSP:
+no `eval` / `new Function` / inline scripts or `style` attributes in the page (Playwright's *string*
+`waitForFunction` / `evaluate` forms use `eval` and fail; pass functions).
 
 Requirements: Python 3.9+ with Pillow and `pillow_heif`; `ffmpeg`/`ffprobe` with libx264,
 libx265 and the native AAC encoder; Node 22; Playwright (for the browser smoke test / E2E).
@@ -64,9 +75,15 @@ Output layout (`--out`, default `tests/fixtures/out`):
 
 ### The trip
 
-Finland, 2025-07-12 … 2025-07-15, trip time zone `Europe/Helsinki` (EEST = UTC+3).
+A fictional four-day trip, 2025-07-12 … 2025-07-15, trip time zone `Europe/Athens` (UTC+3 in summer,
+UTC+2 in winter, EU DST rules). `TRIP_TZ` in `e2e/lib.mjs` (`openSuite()` checks it against
+`manifest.tripTimeZone`) is seeded as the `timeZone` setting, while every browser context runs in
+`DEVICE_TZ` = `America/Los_Angeles` (10 h behind in July: most fixtures fall on another calendar day there), so
+code that formats or groups times in the device's zone instead of the trip zone setting fails the caption and
+day-card checks. The app's default trip zone is the device's zone; the tests of that default compare with the
+page's own zone or pass `contextOptions: { timezoneId }`.
 Every image is ~1280×853 (screenshot 720×1280, `folder_big` 64×48) and shows, in large text, its
-label with the **true local capture time** (e.g. `Day1 12:05 Senate Square`) and its id, on a
+label with the **true local capture time** (e.g. `Day1 12:05 City square`) and its id, on a
 distinct solid background colour. The outer 10 % of every image / video frame is pure background
 colour (`_test.bgColor`), so a test can sample a pixel near a corner of the displayed slide and map
 it back to an id (H.264 shifts colours by a few units; use a tolerance of ~24).
@@ -78,12 +95,12 @@ first 256 KiB) + silent AAC stereo, a static label card with a small moving squa
 
 | id | name | parent | public (API key) | notes |
 |---|---|---|---|---|
-| `folder_root` | `フィンランド旅行 2025` | `mydrive_root` | yes | the slideshow folder |
-| `folder_day1` | `Day1 Helsinki` | root | yes | |
-| `folder_day2` | `Day2 Rovaniemi` | root | yes | |
-| `folder_day3` | `Day3 Lapland` | root | yes | contains `folder_aurora` |
-| `folder_aurora` | `Aurora` | day3 | yes | nested sub-folder |
-| `folder_day4` | `Day4 Porvoo` | root | yes | |
+| `folder_root` | `夏の旅行 2025` | `mydrive_root` | yes | the slideshow folder |
+| `folder_day1` | `Day1 City` | root | yes | |
+| `folder_day2` | `Day2 Lake` | root | yes | |
+| `folder_day3` | `Day3 Mountains` | root | yes | contains `folder_night_sky` |
+| `folder_night_sky` | `Night sky` | day3 | yes | nested sub-folder |
+| `folder_day4` | `Day4 Old town` | root | yes | |
 | `folder_other` | `Friend's photos` | `mydrive_root` | **no** | holds the target of `sc_img_other` (the target file itself is public) |
 | `folder_extra` | `Extra (shared)` | `mydrive_root` | yes | target of folder shortcut `sc_folder_extra` |
 | `folder_private` | `Private trip` | `mydrive_root` | **no** | 2 images, OAuth only |
@@ -100,48 +117,48 @@ following shortcuts). Times are UTC.
 
 | id | name | mime | include | timeSource | appTimeUtcDefault | trueCaptureUtc | notes |
 |---|---|---|---|---|---|---|---|
-| `img_senate_square` | `IMG_1203.JPG` | image/jpeg | ✔ | exif | 2025-07-12T09:05:00.000Z | same | iPhone 15 |
-| `img_helsinki_cathedral` | `IMG_1207.JPG` | image/jpeg | ✔ | exif | 2025-07-12T09:20:00.000Z | same | **EXIF Orientation 6**: stored 1280×853, displayed 853×1280 (`displayRotation: 90`); Drive `rotation: 1` |
+| `img_city_square` | `IMG_1203.JPG` | image/jpeg | ✔ | exif | 2025-07-12T09:05:00.000Z | same | iPhone 15 |
+| `img_cathedral` | `IMG_1207.JPG` | image/jpeg | ✔ | exif | 2025-07-12T09:20:00.000Z | same | **EXIF Orientation 6**: stored 1280×853, displayed 853×1280 (`displayRotation: 90`); Drive `rotation: 1` |
 | `vid_harbour_ferry` | `harbour_ferry.mp4` | video/mp4 | ✔ | mp4-mvhd | 2025-07-12T10:30:00.000Z | same | faststart (moov first) |
 | `img_market_square_canon` | `_MG_2041.JPG` | image/jpeg | ✔ | exif | **2025-07-12T17:10:00.000Z** | 2025-07-12T11:10:00.000Z | Canon EOS R6, clock on JST (+6 h) |
-| `img_suomenlinna_gps` | `IMG_1240.JPG` | image/jpeg | ✔ | exif | 2025-07-12T13:00:00.000Z | same | `imageMediaMetadata.location` 60.1454, 24.9881, 12 m (also EXIF GPS) |
+| `img_fortress_gps` | `IMG_1240.JPG` | image/jpeg | ✔ | exif | 2025-07-12T13:00:00.000Z | same | `imageMediaMetadata.location` 37.9715, 23.7257, 12 m (also EXIF GPS) |
 | `img_trashed` | `IMG_1250.JPG` | image/jpeg | ✘ | | | 2025-07-12T14:00:00.000Z | `trashed: true` |
 | `vid_tram` | `VID_20250712_183000.mp4` | video/mp4 | ✔ | mp4-mvhd | 2025-07-12T15:30:00.000Z | same | Android style, **moov at end** (offset ≈ 437 KB) |
-| `img_sauna` | `sauna.jpg` | image/jpeg | ✔ | drive-times | 2025-07-12T18:40:00.000Z | same | no EXIF, no date in name; `modifiedTime` = capture, `createdTime` = later upload |
-| `img_screenshot` | `Screenshot_20250713-101500.png` | image/png | ✔ | filename | 2025-07-13T07:15:00.000Z | same | no EXIF, Helsinki wall clock in name |
+| `img_cabin` | `wooden_cabin.jpg` | image/jpeg | ✔ | drive-times | 2025-07-12T18:40:00.000Z | same | no EXIF, no date in name; `modifiedTime` = capture, `createdTime` = later upload |
+| `img_screenshot` | `Screenshot_20250713-101500.png` | image/png | ✔ | filename | 2025-07-13T07:15:00.000Z | same | no EXIF, trip-zone wall clock in name |
 | `img_exif_range` | `IMG_1310.JPG` | image/jpeg | ✔ | exif-range | 2025-07-13T08:30:00.000Z | same | **no Drive `time`**; EXIF DTO 11:30 + OffsetTimeOriginal `+03:00` (APP1 within first 64 KiB) |
-| `img_hidden_rovaniemi` | `IMG_1315.JPG` | image/jpeg | ✔ (after reveal) | exif | 2025-07-13T09:40:00.000Z | same | `hiddenUntilRevealed` |
+| `img_hidden_lunch` | `IMG_1315.JPG` | image/jpeg | ✔ (after reveal) | exif | 2025-07-13T09:40:00.000Z | same | `hiddenUntilRevealed` |
 | `img_sony_offset` | `DSC01234.JPG` | image/jpeg | ✔ | exif-range | 2025-07-13T10:05:00.000Z | same | **no Drive `time`**; Sony on JST: DTO 19:05 **+09:00** → correct only if the offset is honoured |
-| `img_arctic_circle_heic` | `IMG_1322.HEIC` | image/heic | ✔ | exif | 2025-07-13T11:45:00.000Z | same | real HEIC (x265); Chromium cannot decode it natively → client-side decode or thumbnail |
-| `img_santa_canon` | `_MG_2107.JPG` | image/jpeg | ✔ | exif | **2025-07-13T19:20:00.000Z** | 2025-07-13T13:20:00.000Z | Canon (+6 h) |
+| `img_viewpoint_heic` | `IMG_1322.HEIC` | image/heic | ✔ | exif | 2025-07-13T11:45:00.000Z | same | real HEIC (x265); Chromium cannot decode it natively → client-side decode or thumbnail |
+| `img_village_canon` | `_MG_2107.JPG` | image/jpeg | ✔ | exif | **2025-07-13T19:20:00.000Z** | 2025-07-13T13:20:00.000Z | Canon (+6 h) |
 | `vid_hevc` | `drone_hevc.mp4` | video/mp4 | ✔ (optional) | mp4-mvhd | 2025-07-13T16:55:00.000Z | same | HEVC `hvc1`, see *Browser notes* |
-| `vid_reindeer_mov` | `IMG_4321.MOV` | video/quicktime | ✔ | mp4-apple | 2025-07-13T18:10:00.000Z | same | iPhone-style MOV: `moov/meta` mdta `com.apple.quicktime.creationdate = 2025-07-13T21:10:00+0300`; mvhd = later export time 2025-07-16T08:00:00Z; moov at end |
+| `vid_deer_mov` | `IMG_4321.MOV` | video/quicktime | ✔ | mp4-apple | 2025-07-13T18:10:00.000Z | same | iPhone-style MOV: `moov/meta` mdta `com.apple.quicktime.creationdate = 2025-07-13T21:10:00+0300`; mvhd = later export time 2025-07-16T08:00:00Z; moov at end |
 | `img_breakfast` | `IMG_1401.JPG` | image/jpeg | ✔ | exif | 2025-07-14T05:45:00.000Z | same | |
-| `vid_pxl_husky` | `PXL_20250714_063000123.mp4` | video/mp4 | ✔ | filename | 2025-07-14T06:30:00.123Z | same | mvhd creation_time = 0, no tags → Pixel filename = **UTC** |
+| `vid_pxl_bike` | `PXL_20250714_063000123.mp4` | video/mp4 | ✔ | filename | 2025-07-14T06:30:00.123Z | same | mvhd creation_time = 0, no tags → Pixel filename = **UTC** |
 | `img_lake` | `IMG_1410.JPG` | image/jpeg | ✔ | exif | 2025-07-14T08:00:00.000Z | same | |
-| `img_hidden_lapland` | `IMG_1415.JPG` | image/jpeg | ✔ (after reveal) | exif | 2025-07-14T10:15:00.000Z | same | `hiddenUntilRevealed` |
+| `img_hidden_berries` | `IMG_1415.JPG` | image/jpeg | ✔ (after reveal) | exif | 2025-07-14T10:15:00.000Z | same | `hiddenUntilRevealed` |
 | `vid_long_walk` | `long_walk.mp4` | video/mp4 | ✔ | mp4-mvhd | 2025-07-14T11:30:00.000Z | same | **8 s** (max-duration tests) |
-| `img_aurora_1` | `IMG_1450.JPG` | image/jpeg | ✔ | exif | 2025-07-14T20:40:00.000Z | same | in `folder_aurora` |
-| `img_aurora_canon` | `_MG_2203.JPG` | image/jpeg | ✔ | exif | **2025-07-15T02:55:00.000Z** | 2025-07-14T20:55:00.000Z | Canon (+6 h), in `folder_aurora` |
-| `img_aurora_2` | `IMG_1452.JPG` | image/jpeg | ✔ | exif | 2025-07-14T21:30:00.000Z | same | in `folder_aurora` |
-| `img_other_kauppatori` | `IMG_5001.JPG` | image/jpeg | ✔ | exif | 2025-07-15T07:15:00.000Z | same | lives in `folder_other`; reached via shortcut `sc_img_other` |
-| `img_porvoo` | `IMG_1480.JPG` | image/jpeg | ✔ | exif | 2025-07-15T08:30:00.000Z | same | |
-| `img_extra_porvoo` | `PXL_20250715_100000000.jpg` | image/jpeg | ✔ | exif | 2025-07-15T10:00:00.000Z | same | Pixel 8, JFIF before Exif; in `folder_extra`, reached via folder shortcut |
+| `img_night_sky_1` | `IMG_1450.JPG` | image/jpeg | ✔ | exif | 2025-07-14T20:40:00.000Z | same | in `folder_night_sky` |
+| `img_night_sky_canon` | `_MG_2203.JPG` | image/jpeg | ✔ | exif | **2025-07-15T02:55:00.000Z** | 2025-07-14T20:55:00.000Z | Canon (+6 h), in `folder_night_sky` |
+| `img_night_sky_2` | `IMG_1452.JPG` | image/jpeg | ✔ | exif | 2025-07-14T21:30:00.000Z | same | in `folder_night_sky` |
+| `img_other_market` | `IMG_5001.JPG` | image/jpeg | ✔ | exif | 2025-07-15T07:15:00.000Z | same | lives in `folder_other`; reached via shortcut `sc_img_other` |
+| `img_old_town` | `IMG_1480.JPG` | image/jpeg | ✔ | exif | 2025-07-15T08:30:00.000Z | same | |
+| `img_extra_old_town` | `PXL_20250715_100000000.jpg` | image/jpeg | ✔ | exif | 2025-07-15T10:00:00.000Z | same | Pixel 8, JFIF before Exif; in `folder_extra`, reached via folder shortcut |
 | `img_airport` | `IMG_1501.JPG` | image/jpeg | ✔ | exif | 2025-07-15T13:45:00.000Z | same | |
 | `txt_notes` | `notes.txt` | text/plain | ✘ | | | | not media |
 | `doc_itinerary` | `旅程表 (itinerary)` | application/vnd.google-apps.document | ✘ | | | | Google Doc, no size, not downloadable |
-| `sc_img_other` | `IMG_5001.JPG` | application/vnd.google-apps.shortcut | ✘ (target ✔) | | | | `shortcutDetails.targetId = img_other_kauppatori` |
+| `sc_img_other` | `IMG_5001.JPG` | application/vnd.google-apps.shortcut | ✘ (target ✔) | | | | `shortcutDetails.targetId = img_other_market` |
 | `sc_folder_extra` | `Extra (shared)` | application/vnd.google-apps.shortcut | ✘ (target ✔) | | | | `targetId = folder_extra`, `targetMimeType` = folder |
 
 Outside the tree: `img_private_1` (2025-07-16 10:00 local), `img_private_2` (09:00),
 `img_reskey_1` (2024-02-10 12:00), `img_reskey_2` (11:00), `big_001…big_120`
 (2025-07-20 from 08:00 local, 3 min apart, shuffled). `createdTime` of in-tree files is a bulk
-upload on 2025-07-16 in folder-path/name order (`modifiedTime` = `createdTime` except `img_sauna`);
+upload on 2025-07-16 in folder-path/name order (`modifiedTime` = `createdTime` except `img_cabin`);
 the hidden ones were "uploaded" on 2025-07-18.
 
 ### App time rules (the oracle)
 
-Trip time zone default `Europe/Helsinki`:
+Trip time zone (setting `timeZone`, `Europe/Athens` in the tests; the app's default is the device's zone):
 
 1. image with Drive `imageMediaMetadata.time` → that wall clock (`YYYY:MM:DD HH:MM:SS`) in the trip zone;
 2. JPEG without Drive time → read EXIF from the first bytes (Range request): `DateTimeOriginal`,
@@ -166,16 +183,16 @@ version as a flat `{ group: minutes }` map are migrated to the folder saved with
 ### Oracles
 
 * `expectedOrderDefault` (25) — included, non-hidden ids sorted by `appTimeUtcDefault` (tie → name):
-  `img_senate_square, img_helsinki_cathedral, vid_harbour_ferry, img_suomenlinna_gps, vid_tram,
-  img_market_square_canon, img_sauna, img_screenshot, img_exif_range, img_sony_offset,
-  img_arctic_circle_heic, vid_hevc, vid_reindeer_mov, img_santa_canon, img_breakfast, vid_pxl_husky,
-  img_lake, vid_long_walk, img_aurora_1, img_aurora_2, img_aurora_canon, img_other_kauppatori,
-  img_porvoo, img_extra_porvoo, img_airport`
-* `expectedOrderWithReveal` (27) — same after `/__admin/reveal-all` (adds `img_hidden_rovaniemi`
-  after `img_exif_range`, `img_hidden_lapland` after `img_lake`).
+  `img_city_square, img_cathedral, vid_harbour_ferry, img_fortress_gps, vid_tram,
+  img_market_square_canon, img_cabin, img_screenshot, img_exif_range, img_sony_offset,
+  img_viewpoint_heic, vid_hevc, vid_deer_mov, img_village_canon, img_breakfast, vid_pxl_bike,
+  img_lake, vid_long_walk, img_night_sky_1, img_night_sky_2, img_night_sky_canon, img_other_market,
+  img_old_town, img_extra_old_town, img_airport`
+* `expectedOrderWithReveal` (27) — same after `/__admin/reveal-all` (adds `img_hidden_lunch`
+  after `img_exif_range`, `img_hidden_berries` after `img_lake`).
 * `expectedOrderCanonFix` (25) — with `{"Canon EOS R6": -360}`; equals `expectedOrderTrue`:
-  `… vid_harbour_ferry, img_market_square_canon, img_suomenlinna_gps, vid_tram, … img_arctic_circle_heic,
-  img_santa_canon, vid_hevc, vid_reindeer_mov, … img_aurora_1, img_aurora_canon, img_aurora_2, …`
+  `… vid_harbour_ferry, img_market_square_canon, img_fortress_gps, vid_tram, … img_viewpoint_heic,
+  img_village_canon, vid_hevc, vid_deer_mov, … img_night_sky_1, img_night_sky_canon, img_night_sky_2, …`
 * `expectedOrderByFolder` — orders for `folder_private`, `folder_reskey`, `folder_big`,
   `folder_extra`, `folder_other`.
 
@@ -191,7 +208,7 @@ treated as UTC, folder-then-name) all differ from the true order.
 ```jsonc
 {
   "schemaVersion": 1, "generator": "tests/fixtures/generate.py", "generatorVersion": 4,
-  "tripTimeZone": "Europe/Helsinki",
+  "tripTimeZone": "Europe/Athens",
   "rootFolderId": "folder_root", "myDriveRootId": "mydrive_root",
   "auth": { "bearerTokens": ["test-token"], "apiKeys": ["TESTKEY"], "resourceKeyHeader": "X-Goog-Drive-Resource-Keys" },
   "thumbnailLinkTemplate": "{BASE_URL}/thumb/{id}=s220",
@@ -221,8 +238,8 @@ replaces it with `http://<Host header>`. Plus a non-Drive `_test` object (never 
 | `public` | effective "anyone with the link" flag (API-key access allowed) |
 | `resourceKey` | resource key required in API-key mode (if any) |
 | `hiddenUntilRevealed` | not listed / 404 until `POST /__admin/reveal` |
-| `trueCaptureUtc`, `trueCaptureLocal` | the real instant (ISO, ms, `Z`) / Helsinki wall clock |
-| `label` | text drawn on the media, e.g. `Day2 21:10 Reindeer` |
+| `trueCaptureUtc`, `trueCaptureLocal` | the real instant (ISO, ms, `Z`) / wall clock in the trip zone |
+| `label` | text drawn on the media, e.g. `Day2 21:10 Deer` |
 | `bgColor` | background colour `#rrggbb` (sample a corner to identify the slide) |
 | `thumbs` | `{ s220, s1024 }` thumbnail paths |
 | `inRootTree`, `folderPath` | location info |
@@ -254,7 +271,7 @@ node tests/mock-drive/server.mjs --port 8787 --fixtures tests/fixtures/out
 ```js
 import { startMockDrive, adminClient } from './tests/mock-drive/server.mjs';
 const drive = await startMockDrive({ port: 0, fixturesDir, maxPageSize: 4 /*, thumbAuth, tokens, keys, latencyMs, inaccessibleList, verbose */ });
-drive.url; drive.admin.reveal('img_hidden_lapland'); await drive.close();
+drive.url; drive.admin.reveal('img_hidden_berries'); await drive.close();
 ```
 
 ### Endpoints
@@ -364,7 +381,8 @@ await browser.close(); await env.close();
   fixtures first if `manifest.json` is missing. The static server serves the repository root with
   `Cache-Control: no-store`, `index.html` for directories (301 to the trailing-slash URL first),
   `text/javascript` for `.js/.mjs`, `application/wasm`, `image/heic`, etc.
-* `startStaticServer({root, port, host})`, `ensureFixtures({force})`, `loadManifest()`.
+* `startStaticServer({root, port, host, cspOrigins})` (`cspOrigins()` → extra loopback origins for the CSP of
+  served HTML; `startServers` passes the mock's URL), `ensureFixtures({force})`, `loadManifest()`.
 * `routeGoogleApis(pageOrContext, driveUrl)` — Playwright route that forwards
   `https://www.googleapis.com/drive/**` (and `content.googleapis.com`) to the mock, for testing the
   app with its default API base. OAuth itself (Google Identity Services) is not mocked: inject a
@@ -409,16 +427,25 @@ is loaded from the global install (`loadPlaywright()`).
 * An init script (`RECORDER` in `lib.mjs`) records, in page order, every slide that becomes
   `#player .slide.visible` (`window.__slideLog`: kind, id, day, caption text, `<img>` natural size,
   src and the colour of a pixel near the photo's corner — compared with the fixture's `bgColor` to
-  prove the *right* picture is on screen), every toast (`window.__toasts`) and the progress of every
-  `<video>` (`window.__video[id]`: max `currentTime`, `videoWidth`, `src`, `muted`).
+  prove the *right* picture is on screen), every toast (`window.__toasts`), the progress of every
+  `<video>` (`window.__video[id]`: max `currentTime`, `videoWidth`, `src`, `muted`) and every
+  `securitypolicyviolation` (`window.__csp`). `cspViolations(app)` / `assertNoCspViolations(app)` combine
+  those with the CSP console messages of the whole context; the full playthrough and the main scenarios
+  (02 › 2, 2c, 10a, 10b · 03 › 4 · 05 › 9a, 9c, 9d · 06 › 11, 11b · 09 › 20 · 11 › S1, S4, S4b) assert none.
+* `app.waitForLog(pred)` waits until `pred(window.__slideLog)` is true (`pred` runs in the page and must be a
+  function, not source text — see the CSP note above).
 * The mock's request log (`admin.log()`): auth type, Range, resource-key header, origin (requests
   with the app origin and `mode: cors` come from the Service Worker), status.
-* Settings are seeded into `localStorage` before the first load (`FAST_SETTINGS`: 1 s photos,
-  2 s videos, no auto refresh) unless a test passes `settings: null`; URL parameters still win.
+* Settings are seeded into `localStorage` (`SETTINGS_KEY` = `photo-slideshow.settings.v1`) before the first
+  load (`FAST_SETTINGS`: 1 s photos, 2 s videos, no auto refresh, trip zone `TRIP_TZ`) unless a test passes
+  `settings: null`; URL parameters still win. Browser contexts run in `DEVICE_TZ` (`America/Los_Angeles`)
+  unless a test passes `contextOptions: { timezoneId }`; with `settings: null` the trip zone defaults to it.
 * Google Identity Services is replaced by `GIS_STUB` (route on `accounts.google.com/gsi/client`):
   `window.__nextToken`, `__nextExpiresIn`, `__nextTokenError` steer the next token response and
-  `window.__gis.requests` counts token requests. `https://drive.google.com/**` (the `/preview`
-  iframe) is answered with a stub page and recorded (`app.previewRequests`).
+  `window.__gis.requests` counts token requests, `window.__gis.clientId` is the client ID it was initialised
+  with and `window.__gis.revoked` lists revoked tokens. `https://drive.google.com/**` (the `/preview`
+  iframe) is answered with a stub page and recorded (`app.previewRequests`). A test can serve a deployment
+  `config.js` with `context.route()` (11-security `withDeployConfig`).
 
 ### Files and scenarios
 
@@ -427,13 +454,14 @@ is loaded from the global install (`loadPlaywright()`).
 | `01-catalog` | 1 order/times/exclusions/shortcuts/pagination/title & day cards · 1b metadata cache on reload · 3 background EXIF refinement · 3b refinement with a wrong trip zone (requests held with `route`) |
 | `02-playthrough` | 2 full playthrough (sequence, captions, colours, SW Range streaming, HEVC → Drive embed, 2 s video cap, loop) · 2b SW proxy contract · 2c Content-Range hidden by CORS (header-stripping proxy) · 10 `serviceWorkers:'block'` (the SW never activates → the app times out and plays without it) · 10a/10b no Service Worker API (direct URL / blob) |
 | `03-grid-refresh-controls` | 4 Canon −6 h correction via the grid, persisted per folder · 5 manual refresh · 5c current photo deleted → the next item is not skipped · 5b automatic refresh (`?refresh=0.05`) · 6 keyboard + HUD controls |
-| `04-errors-reskey-share` | 7a start-up errors · 7b form validation + URL forms · 7b2 invalid time zone rejected · 7c broken photo skipped · 7d thumbnail fallback after the SW's retries (4 × 503) · 8 resource keys · 15 share link |
-| `05-oauth` | 9a OAuth start · 9b token expiry → overlay → re-login · 9c folder search / login status · 9d HEVC fallback in OAuth · 9e expiring banner · 9f login denied/cancelled · 9g two tabs with different credentials (per-tab credentials in the SW, checked with an `<img>` through the SW) |
+| `04-errors-reskey-share` | 7a start-up errors · 7b form validation + URL forms · 7b2 invalid time zone rejected · 7c broken photo skipped · 7d thumbnail fallback after the SW's retries (4 × 503) · 8 resource keys · 15 share link (the default zone is the browser's, `DEVICE_TZ`; `tz` always included, also for the default zone) |
+| `05-oauth` | 9a OAuth start · 9b token expiry → overlay → re-login · 9c folder search / login status · 9d HEVC fallback in OAuth · 9e expiring banner · 9f login denied/cancelled · 9g two tabs with different credentials (per-tab credentials in the SW, checked with an `<img>` through the SW; the API-key tab's link shows the link warning because the OAuth tab saved its client in the same profile, so it is started with 開始) |
 | `06-media-mobile` | 11 HEIC via heic-to (vendored in `js/vendor/`, CDN hosts blocked to prove no network is needed) · 11c `js/vendor/heic-to.js` blocked → thumbnail · 11b fast (thumbnail) quality · 12 EXIF orientation · 13 mobile 390×844 + swipe · 16 loop=0 end card · 17 cancel loading · 18 sound after a click / muted autostart |
 | `07-big-folder` | 14 `folder_big` (120 photos, pages of 50), grid with 120 tiles |
-| `08-settings` | 19 display settings from the form, persisted; sub-folder switch; full screen |
+| `08-settings` | 19 display settings from the form, persisted (the default trip zone is the browser's `DEVICE_TZ`; `TRIP_TZ` typed into the form is used for the captions and saved); sub-folder switch; full screen · 19b the default trip zone is the browser's zone (context `America/New_York`), shared in the link; `tz=` wins |
 | `09-private-thumbnails` | 20 thumbnails needing auth (`thumbAuth: 'required'`): show unaffected, grid fallback tiles |
 | `10-fixes` | regression tests of review findings: F5 SW ignores navigations / iframes, `nosniff` + CSP + safe Content-Type · F10 a single 503 on a photo download is retried → original shown · F10b/F24 an aborted photo download makes no further upstream requests (photo originals are fetched by the page, not the SW; the SW does not retry page `fetch()`) · F6 unreadable folder-shortcut target skipped (toast), show plays · F7/F14 a refresh held across a folder switch does not overwrite the new show · F1 corrections per folder + `fix=…&fix=*` in the share link (replaces the recipient's older corrections of that folder) · F0 corrections do not apply to `（タイムゾーン記録あり）` groups (an offset equal to the trip zone keeps the plain group) · F17 キャンセル during the SW wait · F19 Escape / G close the grid after focus left it · F13b a pause from outside the app pauses the show (no forced mute, no skip) · F18b 「次へ」 with audio locked keeps the outgoing video muted · R3 適用 keeps saved corrections of groups not listed yet (EXIF read held with `route`; such groups are listed with 0 items) · R4 corrections saved by the previous version (flat format) still apply to videos whose group changed · R6 a tile picked while a video is paused under the grid: the old video is not resumed during a slow load (mock latency) · R7 → near the end of a video: the outgoing video stops, the next slide is not skipped · R8 a refresh removing the slide being loaded: the slide that moved into its place is shown · R9 the HUD hides again after 「もう一度見る」 / the list coming back from empty · R10 Media Session play / nexttrack ignored while the grid is open (handlers captured with an init script) · R11 pause during the muted autoplay retry (Safari policy emulated) keeps the video · R12 expiry banner when the show starts after the warning time · R13 「延長する」 finishing after expiry closes the re-login dialog · R14 the re-login dialog is modal (focus never reaches the grid) · R15 フォルダを検索 + スライドショーを開始 waiting for one login · R16 background EXIF refinement restarts after re-login |
+| `11-security` | regression tests of the security review of the public deployment: S1 `config.js` with a client ID (served through `route`): a crafted `?clientId=` / `?key=` / `?mode=` link, stored values and an altered (hidden) form field cannot change the OAuth client (GIS initialised with the config client), nothing of them is saved, the share link carries no `mode` / `clientId` / `key`, 「はじめての方へ」 shows no client ID / API key steps; `config.js` with only an API key: API-key mode with that key, GIS never loaded, login UI hidden · S2 unlocked deployment: a link key / client ID that differs from the saved one shows 「リンクで指定された接続設定です…」, no autostart, nothing used or saved until 開始 is pressed with the warning visible; 「保存済みの接続設定に戻す」 reverts; also when the link switches the mode and brings the other value (only an OAuth client saved + `?key=…&autostart=1`; only an API key saved + `?mode=oauth&clientId=…`) · S3 an autostart link's folder / title / key / tz are not saved by M or by 補正を適用 (only `videoMuted` / that folder's corrections) · S4 every Drive API `fetch()` of the page uses `cache: 'no-store'` (recorded by wrapping `fetch`; Playwright's routing disables the HTTP cache, so request headers cannot show it); ログアウト offered for an expired token, it revokes the token and clears the token and the metadata cache, settings kept · S4b ログアウト also offered after a reload with an expired token (kept as expired, removed by ログアウト) and after a 401 dropped the token (the metadata cache is left) · S5 `need-creds` from another same-origin Service Worker (`e2e/foreign-sw.js`, scope `/tests/e2e/`) gets no answer and a forced one does not drop the token; the app's own worker still gets credentials · S6 the CSP is really enforced in the tests (inline script, foreign `fetch` / `<img>` / `<script>` blocked and reported) |
 
 Tests whose title starts with **`[APP BUG]`** reproduce a defect of the app and fail until it is
 fixed (the assertion message names the suspected code). Keep them failing rather than weakening them.

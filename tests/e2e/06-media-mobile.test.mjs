@@ -3,7 +3,7 @@
 import { test, before, after } from 'node:test';
 import path from 'node:path';
 import {
-  openSuite, assert, assertNoPageErrors, colorNear, screenPixels, OUT_DIR, TEST_KEY, sleep,
+  openSuite, assert, assertNoPageErrors, assertNoCspViolations, colorNear, screenPixels, OUT_DIR, TEST_KEY, sleep,
 } from './lib.mjs';
 
 let suite;
@@ -36,20 +36,21 @@ test('11. HEIC photo is converted in the browser (heic-to vendored in js/vendor/
   });
   await app.goto();
   await app.waitForPlayer();
-  const e = await jumpTo(app, 'img_arctic_circle_heic', 90000);
+  const e = await jumpTo(app, 'img_viewpoint_heic', 90000);
   assert.match(e.src, /^blob:/, `converted image is a blob (not the Drive thumbnail): ${e.src}`);
   assert.equal(e.nw, 1280);
   assert.equal(e.nh, 853);
-  assert.ok(colorNear(e.color, suite.byId.img_arctic_circle_heic._test.bgColor, 32), `colour ${e.color} vs ${suite.byId.img_arctic_circle_heic._test.bgColor}`);
+  assert.ok(colorNear(e.color, suite.byId.img_viewpoint_heic._test.bgColor, 32), `colour ${e.color} vs ${suite.byId.img_viewpoint_heic._test.bgColor}`);
   const loaded = await app.page.evaluate(() => performance.getEntriesByType('resource').map((r) => r.name).filter((n) => n.includes('heic-to')));
   assert.ok(loaded.length > 0, 'heic-to was loaded');
   for (const u of loaded) assert.equal(new URL(u).pathname, '/js/vendor/heic-to.js', `heic-to comes from the app origin: ${u}`);
   assert.deepEqual(external, [], 'no CDN requests');
   // the original HEIC bytes were downloaded (not only the thumbnail)
-  const reqs = (await suite.admin.log()).filter((x) => x.path === '/drive/v3/files/img_arctic_circle_heic' && x.query.alt === 'media' && !x.range);
+  const reqs = (await suite.admin.log()).filter((x) => x.path === '/drive/v3/files/img_viewpoint_heic' && x.query.alt === 'media' && !x.range);
   assert.ok(reqs.some((x) => x.status === 200));
   await app.screenshot('heic-slide');
   assertNoPageErrors(app);
+  await assertNoCspViolations(app);
   await app.close();
 })(t));
 
@@ -63,12 +64,12 @@ test('11c. HEIC with the conversion library unreachable (js/vendor/heic-to.js bl
   });
   await app.goto();
   await app.waitForPlayer();
-  const e = await jumpTo(app, 'img_arctic_circle_heic', 30000);
+  const e = await jumpTo(app, 'img_viewpoint_heic', 30000);
   assert.ok(blocked > 0, 'the app tried to load heic-to');
-  assert.ok(e.src.startsWith(`${suite.env.driveUrl}/thumb/img_arctic_circle_heic=s`), `thumbnail fallback: ${e.src}`);
+  assert.ok(e.src.startsWith(`${suite.env.driveUrl}/thumb/img_viewpoint_heic=s`), `thumbnail fallback: ${e.src}`);
   assert.ok(e.nw > 0);
   // the show goes on
-  await app.waitForSlide({ id: 'vid_hevc' }, 20000).catch(() => app.waitForSlide({ id: 'img_santa_canon' }, 20000));
+  await app.waitForSlide({ id: 'vid_hevc' }, 20000).catch(() => app.waitForSlide({ id: 'img_village_canon' }, 20000));
   assertNoPageErrors(app);
   await app.close();
 })(t));
@@ -77,18 +78,19 @@ test('11b. imageQuality=fast uses Drive thumbnails (also for HEIC, without conve
   await suite.admin.reset();
   const app = await suite.newApp({ params: ROOT_PARAMS, settings: { imageQuality: 'fast' } });
   await app.waitForPlayer();
-  const first = await jumpTo(app, 'img_senate_square', 20000);
-  assert.ok(first.src.startsWith(`${suite.env.driveUrl}/thumb/img_senate_square=s`), first.src);
-  const heic = await jumpTo(app, 'img_arctic_circle_heic', 20000);
-  assert.ok(heic.src.startsWith(`${suite.env.driveUrl}/thumb/img_arctic_circle_heic=s`), heic.src);
+  const first = await jumpTo(app, 'img_city_square', 20000);
+  assert.ok(first.src.startsWith(`${suite.env.driveUrl}/thumb/img_city_square=s`), first.src);
+  const heic = await jumpTo(app, 'img_viewpoint_heic', 20000);
+  assert.ok(heic.src.startsWith(`${suite.env.driveUrl}/thumb/img_viewpoint_heic=s`), heic.src);
   assert.equal(heic.nw, 1024, 'large thumbnail variant');
   const loaded = await app.page.evaluate(() => performance.getEntriesByType('resource').some((r) => r.name.includes('heic-to')));
   assert.equal(loaded, false, 'no HEIC library needed');
   assertNoPageErrors(app);
+  await assertNoCspViolations(app);
   await app.close();
 })(t));
 
-test('12. EXIF orientation 6: img_helsinki_cathedral is displayed upright (portrait)', { timeout: 120000 }, (t) => suite.wrap('12-orientation', async () => {
+test('12. EXIF orientation 6: img_cathedral is displayed upright (portrait)', { timeout: 120000 }, (t) => suite.wrap('12-orientation', async () => {
   await suite.admin.reset();
   // no blurred backdrop / zoom, so that the area beside a portrait photo is plain black
   const app = await suite.newApp({ params: ROOT_PARAMS, settings: { blurBackground: false, kenBurns: false } });
@@ -102,23 +104,23 @@ test('12. EXIF orientation 6: img_helsinki_cathedral is displayed upright (portr
     await app.page.mouse.move(1, 1);
     return (await app.slideLog()).find((x) => x.id === id);
   };
-  const e = await check('img_helsinki_cathedral');
-  const exp = suite.byId.img_helsinki_cathedral._test.expected;
+  const e = await check('img_cathedral');
+  const exp = suite.byId.img_cathedral._test.expected;
   assert.equal(e.nw, exp.displayWidth);
   assert.equal(e.nh, exp.displayHeight);
   assert.ok(e.nw < e.nh, 'portrait');
-  assert.ok(colorNear(e.color, suite.byId.img_helsinki_cathedral._test.bgColor), `colour ${e.color}`);
+  assert.ok(colorNear(e.color, suite.byId.img_cathedral._test.bgColor), `colour ${e.color}`);
   // 853×1280 in a 1280×720 viewport → ~480 px wide in the middle; x=200 is outside the picture
-  const bg = suite.byId.img_helsinki_cathedral._test.bgColor;
+  const bg = suite.byId.img_cathedral._test.bgColor;
   const [top, side] = await screenPixels(app.page, [[640, 15], [200, 15]]);
   assert.ok(colorNear(top, bg), `top centre is the photo: ${top} vs ${bg}`);
   assert.ok(side.every((v) => v < 30), `left of a portrait photo is black: ${side}`);
   await app.screenshot('orientation-cathedral');
   // control: a landscape photo covers x=200
   await app.page.keyboard.press('ArrowLeft');
-  await check('img_senate_square');
+  await check('img_city_square');
   const [side2] = await screenPixels(app.page, [[200, 15]]);
-  assert.ok(colorNear(side2, suite.byId.img_senate_square._test.bgColor), `landscape photo covers x=200: ${side2}`);
+  assert.ok(colorNear(side2, suite.byId.img_city_square._test.bgColor), `landscape photo covers x=200: ${side2}`);
   assertNoPageErrors(app);
   await app.close();
 })(t));
@@ -236,7 +238,7 @@ test('18. started by a click (user gesture): videos play with sound; autostart (
   const app = await suite.newApp({ params: { folder: 'folder_root', key: TEST_KEY, mode: 'apikey', interval: 1 }, settings: { videoMuted: false } });
   await app.page.click('#btn-start');
   await app.waitForPlayer();
-  await jumpTo(app, 'img_senate_square', 20000).catch(() => {});
+  await jumpTo(app, 'img_city_square', 20000).catch(() => {});
   await app.page.keyboard.press('g');
   await app.page.waitForSelector('#grid-overlay:not([hidden])');
   await app.page.click('#grid-body .tile[data-id="vid_harbour_ferry"]');

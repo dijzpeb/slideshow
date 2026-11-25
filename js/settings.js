@@ -1,9 +1,9 @@
 // 設定の既定値・保存・URL パラメータ
 
-import { isValidTimeZone } from './timeutil.js';
+import { isValidTimeZone, deviceTimeZone } from './timeutil.js';
 import { DRIVE_API_DEFAULT, parseFolderInput } from './drive.js';
 
-const STORAGE_KEY = 'finland-slideshow.settings.v1';
+const STORAGE_KEY = 'photo-slideshow.settings.v1';
 
 export const DEFAULTS = Object.freeze({
   authMode: 'oauth', // 'oauth' | 'apikey'
@@ -23,7 +23,7 @@ export const DEFAULTS = Object.freeze({
   loop: true,
   includeSubfolders: true,
   refreshMinutes: 5, // 0 = 自動更新しない
-  timeZone: 'Europe/Helsinki',
+  timeZone: deviceTimeZone(), // 撮影地のタイムゾーン。既定はこの端末のタイムゾーン
   imageQuality: 'original', // 'original' | 'fast'
   preciseTimes: true, // 写真の EXIF をファイルから直接読んで撮影時刻を補正する
   cameraOffsets: {}, // { [フォルダ ID]: { [補正グループ名]: 分 } }
@@ -257,22 +257,65 @@ export function settingsFromUrl(search) {
 }
 
 /**
- * 設定を読み込む。優先順位: URL パラメータ > ブラウザに保存した値 > config.js > 既定値
+ * config.js で固定された接続設定。公開サイトで、細工したリンク（?clientId=... など）や保存済みの値に
+ * 別の OAuth クライアント・API キーを使わせないため、config.js に値があればそれだけを使う。
+ *  - clientId だけ: Google アカウントでのログインのみ（API キーは使えない）
+ *  - apiKey だけ: API キーのみ（ログインは使えない）
+ *  - 両方: 接続方法は選べるが、値は config.js のもの
+ * @param {object} [deployConfig] window.SLIDESHOW_CONFIG
+ * @returns {{clientId:boolean, apiKey:boolean, any:boolean, authMode:'oauth'|'apikey'|null, values:{clientId:string, apiKey:string}}}
+ *   clientId / apiKey: その値が固定されているか。authMode: 接続方法が固定されていればその方法（選べるなら null）
+ */
+export function authLock(deployConfig) {
+  const dc = deployConfig || {};
+  const clientId = typeof dc.clientId === 'string' ? dc.clientId.trim() : '';
+  const apiKey = typeof dc.apiKey === 'string' ? dc.apiKey.trim() : '';
+  let authMode = null;
+  if (clientId && !apiKey) authMode = 'oauth';
+  else if (apiKey && !clientId) authMode = 'apikey';
+  return Object.freeze({ clientId: !!clientId, apiKey: !!apiKey, any: !!(clientId || apiKey), authMode, values: Object.freeze({ clientId, apiKey }) });
+}
+
+/** 固定された接続設定を当てはめた新しい設定を返す（フォーム・URL・保存済みの値より常に優先） */
+export function applyAuthLock(settings, lock) {
+  const s = { ...(settings || {}) };
+  if (!lock || !lock.any) return s;
+  if (lock.clientId) s.clientId = lock.values.clientId;
+  if (lock.apiKey) s.apiKey = lock.values.apiKey;
+  if (lock.authMode === 'oauth') s.apiKey = '';
+  if (lock.authMode === 'apikey') s.clientId = '';
+  if (lock.authMode) s.authMode = lock.authMode;
+  return s;
+}
+
+/** 固定された項目を取り除く（URL・保存済みの値から） */
+function withoutLocked(o, lock) {
+  const out = { ...o };
+  if (lock.clientId || lock.authMode) delete out.clientId;
+  if (lock.apiKey || lock.authMode) delete out.apiKey;
+  if (lock.authMode) delete out.authMode;
+  return out;
+}
+
+/**
+ * 設定を読み込む。優先順位: URL パラメータ > ブラウザに保存した値 > config.js > 既定値。
+ * ただし config.js に OAuth クライアント ID / API キーがあれば、接続設定はそれに固定する（authLock）
  * @param {object} [deployConfig] window.SLIDESHOW_CONFIG
  */
 export function loadSettings(deployConfig = {}, search = '') {
   const dc = deployConfig || {};
+  const lock = authLock(dc);
   const fromDeploy = {};
-  if (dc.clientId) fromDeploy.clientId = dc.clientId;
-  if (dc.apiKey) fromDeploy.apiKey = dc.apiKey;
   if (dc.folder) fromDeploy.folder = dc.folder;
   if (dc.title) fromDeploy.title = dc.title;
   if (dc.timeZone) fromDeploy.timeZone = dc.timeZone;
   if (dc.authMode) fromDeploy.authMode = dc.authMode;
-  else if (dc.apiKey && !dc.clientId) fromDeploy.authMode = 'apikey';
   const stored = migrateStoredOffsets(readStored(), fromDeploy.folder);
   const fromUrl = settingsFromUrl(search);
-  const merged = { ...fromDeploy, ...stored, ...fromUrl };
+  const urlSettings = withoutLocked(fromUrl, lock);
+  // API キーが固定されていれば、リンクの key は値も「key だけなら API キー方式」の規則も使わない（mode があればそれに従う）
+  if (lock.apiKey && !new URLSearchParams(search).has('mode')) delete urlSettings.authMode;
+  const merged = { ...fromDeploy, ...withoutLocked(stored, lock), ...urlSettings };
   if (fromUrl.cameraOffsets) {
     // URL の補正はそのフォルダの保存済みの補正に上書きでまとめる（他のフォルダはそのまま）。
     // fix=*（アプリが作る共有リンク）ならそのフォルダの補正を置き換える
@@ -287,23 +330,85 @@ export function loadSettings(deployConfig = {}, search = '') {
     merged.cameraOffsets = all;
     merged.legacyCameraOffsets = legacy;
   }
-  return sanitize(merged);
+  return sanitize(applyAuthLock(merged, lock));
 }
 
-/** 同じ設定で開ける共有用 URL を作る（OAuth の場合は各自がログインする） */
-export function buildShareUrl(baseUrl, settings) {
+/**
+ * 接続設定が固定されていない配布で、リンク（URL）の OAuth クライアント ID / API キーが、このブラウザに
+ * 保存済みの接続設定と違うか。違えば黙って使わず、利用者に確かめてもらう（細工したリンク対策）。
+ * このブラウザに接続設定（クライアント ID か API キー）が保存されていれば、保存していない方式の値も
+ * 「違う」とみなす（API キーだけを保存したブラウザに mode=oauth&clientId=... のリンクで別のクライアントを
+ * 使わせる、などを防ぐ）。何も保存していなければ比べるものがないので null（初めて開くリンクはそのまま使う）。
+ * @returns {{clientId:boolean, apiKey:boolean, stored:{authMode:string, clientId:string, apiKey:string}}|null}
+ *   stored: 「保存済みの設定に戻す」で使う、保存済みの接続設定
+ */
+export function linkAuthConflict(deployConfig = {}, search = '') {
+  if (authLock(deployConfig).any) return null;
+  const stored = readStored();
+  const str = (v) => (typeof v === 'string' ? v.trim() : '');
+  if (!str(stored.clientId) && !str(stored.apiKey)) return null;
+  const fromUrl = settingsFromUrl(search);
+  const differs = (k) => !!str(fromUrl[k]) && str(fromUrl[k]) !== str(stored[k]);
+  const clientId = differs('clientId');
+  const apiKey = differs('apiKey');
+  if (!clientId && !apiKey) return null;
+  const s = sanitize(stored);
+  return { clientId, apiKey, stored: { authMode: s.authMode, clientId: s.clientId, apiKey: s.apiKey } };
+}
+
+/**
+ * 保存済みの設定の一部だけを書き換える（再生中のミュートの切り替え、時刻補正の適用など）。
+ * 今の設定をまるごと保存すると、リンクで渡されただけの値（フォルダ・タイトル・API キーなど）まで
+ * 保存されてしまうため、変えた項目だけを保存済みの値にまとめる。
+ * @param {object|((stored:object)=>object)} patch 書き換える項目、または保存済みの設定から新しい設定を作る関数
+ * @param {{fallbackFolder?:string}} [opts] 以前の版の補正を移すフォルダ（config.js のフォルダ）
+ */
+export function updateStoredSettings(patch, { fallbackFolder = '' } = {}) {
+  const stored = migrateStoredOffsets(readStored(), fallbackFolder);
+  const next = typeof patch === 'function' ? patch(stored) : { ...stored, ...(patch || {}) };
+  // 検証はするが、既定値で埋めない（保存されていなかった項目は保存しないまま）
+  const clean = sanitize(next);
+  const out = {};
+  for (const k of Object.keys(clean)) if (hasOwn(next, k)) out[k] = clean[k];
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(out));
+  } catch {
+    /* 保存できなくても動作は続ける */
+  }
+}
+
+/** source の、このフォルダの時刻補正（以前の版の補正も含む）だけを target に写した新しい設定を返す */
+export function withFolderOffsetsFrom(target, source, folderId) {
+  const s = withFolderOffsets(target, folderId, offsetsForFolder(source, folderId));
+  const legacy = legacyOffsetsForFolder(source, folderId);
+  const hasLegacy = Object.keys(legacy).length > 0 && validFolderId(folderId);
+  // 以前の版の補正がどちらにもなければ、項目ごと書かない
+  if (!hasLegacy && !(target && target.legacyCameraOffsets)) return s;
+  const out = withoutLegacyOffsets(s, folderId);
+  if (hasLegacy) out.legacyCameraOffsets = { ...out.legacyCameraOffsets, [folderId]: legacy };
+  return out;
+}
+
+/**
+ * 同じ設定で開ける共有用 URL を作る（OAuth の場合は各自がログインする）。
+ * config.js で固定された接続設定（lock）はリンクに含めない（開いた側も同じ config.js を使う）
+ */
+export function buildShareUrl(baseUrl, settings, lock = authLock({})) {
   const u = new URL(baseUrl);
   u.search = '';
   u.hash = '';
   if (settings.folder) u.searchParams.set('folder', settings.folder);
-  if (settings.authMode === 'apikey') {
-    u.searchParams.set('mode', 'apikey');
-    if (settings.apiKey) u.searchParams.set('key', settings.apiKey);
-  } else {
-    u.searchParams.set('mode', 'oauth');
-    if (settings.clientId) u.searchParams.set('clientId', settings.clientId);
+  // 接続方法を選べる配布なら方法だけは伝える。クライアント ID / API キーは固定されていなければ付ける
+  if (!lock.authMode) u.searchParams.set('mode', settings.authMode === 'apikey' ? 'apikey' : 'oauth');
+  if (!lock.any) {
+    if (settings.authMode === 'apikey') {
+      if (settings.apiKey) u.searchParams.set('key', settings.apiKey);
+    } else if (settings.clientId) {
+      u.searchParams.set('clientId', settings.clientId);
+    }
   }
-  if (settings.timeZone !== DEFAULTS.timeZone) u.searchParams.set('tz', settings.timeZone);
+  // 既定のタイムゾーンは開く人の端末によって違うので、同じ値でも必ず付ける
+  u.searchParams.set('tz', settings.timeZone || DEFAULTS.timeZone);
   if (settings.title) u.searchParams.set('title', settings.title);
   // このフォルダのカメラ別補正（分を先に書くのでグループ名に ':' があってもよい）。
   // fix=* で、これがこのフォルダの補正のすべてであることを示す（開いた側の古い補正を残さない。補正がなくても付ける）

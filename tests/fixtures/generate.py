@@ -52,8 +52,9 @@ HERE = Path(__file__).resolve().parent
 SCRIPT_HASH = hashlib.sha256(Path(__file__).read_bytes()).hexdigest()[:16]
 DEFAULT_OUT = HERE / 'out'
 
-TRIP_TZ_NAME = 'Europe/Helsinki'
-HEL = ZoneInfo(TRIP_TZ_NAME)
+# Europe/Athens: UTC+2 in winter, UTC+3 (summer time) from late March to late October
+TRIP_TZ_NAME = 'Europe/Athens'
+TRIP_TZ = ZoneInfo(TRIP_TZ_NAME)
 UTC = timezone.utc
 TRIP_DAY1 = datetime(2025, 7, 12).date()
 
@@ -84,12 +85,12 @@ CAMERAS = {
 # Folders. "public" means "anyone with the link" (API-key access allowed). Children
 # inherit the effective public flag of their parent unless they override it.
 FOLDERS = [
-    dict(id=ROOT, name='フィンランド旅行 2025', parent=MYDRIVE, public=True),
-    dict(id='folder_day1', name='Day1 Helsinki', parent=ROOT),
-    dict(id='folder_day2', name='Day2 Rovaniemi', parent=ROOT),
-    dict(id='folder_day3', name='Day3 Lapland', parent=ROOT),
-    dict(id='folder_aurora', name='Aurora', parent='folder_day3'),
-    dict(id='folder_day4', name='Day4 Porvoo', parent=ROOT),
+    dict(id=ROOT, name='夏の旅行 2025', parent=MYDRIVE, public=True),
+    dict(id='folder_day1', name='Day1 City', parent=ROOT),
+    dict(id='folder_day2', name='Day2 Lake', parent=ROOT),
+    dict(id='folder_day3', name='Day3 Mountains', parent=ROOT),
+    dict(id='folder_night_sky', name='Night sky', parent='folder_day3'),
+    dict(id='folder_day4', name='Day4 Old town', parent=ROOT),
     dict(id='folder_other', name="Friend's photos", parent=MYDRIVE, public=False),
     dict(id='folder_extra', name='Extra (shared)', parent=MYDRIVE, public=True),
     dict(id='folder_private', name='Private trip', parent=MYDRIVE, public=False),
@@ -102,9 +103,9 @@ FOLDERS = [
 def photo(id, name, parent, local, title, camera=None, fmt='jpeg', skew=0, offset_tag=None,
           drive_time=True, orientation=1, gps=None, hidden=False, trashed=False, public=None,
           resource_key=None, jfif=False, size=(1280, 853), created=None, modified=None):
-    """A still image. `local` is the TRUE Helsinki wall clock of the capture.
+    """A still image. `local` is the TRUE wall clock of the capture in the trip time zone.
 
-    skew:       minutes the camera clock is ahead of Helsinki (EXIF wall clock = local + skew)
+    skew:       minutes the camera clock is ahead of the trip zone (EXIF wall clock = local + skew)
     offset_tag: EXIF OffsetTimeOriginal written into the file (None = not written)
     drive_time: whether Drive's imageMediaMetadata.time is present (False = "not processed")
     camera=None means: no EXIF at all.
@@ -128,70 +129,70 @@ def video(id, name, parent, local, title, container='mp4', codec='h264', duratio
 
 
 MEDIA = [
-    # ---------------- Day 1 (2025-07-12, Helsinki) ----------------
-    photo('img_senate_square', 'IMG_1203.JPG', 'folder_day1', '2025-07-12 12:05:00',
-          'Senate Square', 'iphone15', offset_tag='+03:00'),
-    photo('img_helsinki_cathedral', 'IMG_1207.JPG', 'folder_day1', '2025-07-12 12:20:00',
-          'Helsinki Cathedral', 'iphone15', offset_tag='+03:00', orientation=6),
+    # ---------------- Day 1 (2025-07-12, city) ----------------
+    photo('img_city_square', 'IMG_1203.JPG', 'folder_day1', '2025-07-12 12:05:00',
+          'City square', 'iphone15', offset_tag='+03:00'),
+    photo('img_cathedral', 'IMG_1207.JPG', 'folder_day1', '2025-07-12 12:20:00',
+          'Cathedral', 'iphone15', offset_tag='+03:00', orientation=6),
     video('vid_harbour_ferry', 'harbour_ferry.mp4', 'folder_day1', '2025-07-12 13:30:00',
           'Harbour ferry', faststart=True, duration=3),
     photo('img_market_square_canon', '_MG_2041.JPG', 'folder_day1', '2025-07-12 14:10:00',
           'Market Square', 'canon', skew=360),
-    photo('img_suomenlinna_gps', 'IMG_1240.JPG', 'folder_day1', '2025-07-12 16:00:00',
-          'Suomenlinna', 'iphone15', offset_tag='+03:00', gps=(60.145400, 24.988100, 12.0)),
+    photo('img_fortress_gps', 'IMG_1240.JPG', 'folder_day1', '2025-07-12 16:00:00',
+          'Fortress', 'iphone15', offset_tag='+03:00', gps=(37.971500, 23.725700, 12.0)),
     photo('img_trashed', 'IMG_1250.JPG', 'folder_day1', '2025-07-12 17:00:00',
           'Blurry (trashed)', 'iphone15', trashed=True),
     video('vid_tram', 'VID_20250712_183000.mp4', 'folder_day1', '2025-07-12 18:30:00',
           'Tram ride', faststart=False, duration=3),
-    photo('img_sauna', 'sauna.jpg', 'folder_day1', '2025-07-12 21:40:00', 'Sauna', None,
+    photo('img_cabin', 'wooden_cabin.jpg', 'folder_day1', '2025-07-12 21:40:00', 'Cabin', None,
           drive_time=False, modified='TRUE', created='2025-07-19T07:45:12.000Z'),
-    # ---------------- Day 2 (2025-07-13, Rovaniemi) ----------------
+    # ---------------- Day 2 (2025-07-13, lake) ----------------
     photo('img_screenshot', 'Screenshot_20250713-101500.png', 'folder_day2',
           '2025-07-13 10:15:00', 'Train ticket', None, fmt='png', size=(720, 1280),
           drive_time=False),
     photo('img_exif_range', 'IMG_1310.JPG', 'folder_day2', '2025-07-13 11:30:00',
-          'Rovaniemi station', 'iphone15', offset_tag='+03:00', drive_time=False),
-    photo('img_hidden_rovaniemi', 'IMG_1315.JPG', 'folder_day2', '2025-07-13 12:40:00',
+          'Lakeside station', 'iphone15', offset_tag='+03:00', drive_time=False),
+    photo('img_hidden_lunch', 'IMG_1315.JPG', 'folder_day2', '2025-07-13 12:40:00',
           'Lunch (added later)', 'iphone15', offset_tag='+03:00', hidden=True),
     photo('img_sony_offset', 'DSC01234.JPG', 'folder_day2', '2025-07-13 13:05:00',
-          'Kemijoki river', 'sony', skew=360, offset_tag='+09:00', drive_time=False),
-    photo('img_arctic_circle_heic', 'IMG_1322.HEIC', 'folder_day2', '2025-07-13 14:45:00',
-          'Arctic Circle', 'iphone15pro', fmt='heic', offset_tag='+03:00'),
-    photo('img_santa_canon', '_MG_2107.JPG', 'folder_day2', '2025-07-13 16:20:00',
-          'Santa Claus Village', 'canon', skew=360),
+          'River boat', 'sony', skew=360, offset_tag='+09:00', drive_time=False),
+    photo('img_viewpoint_heic', 'IMG_1322.HEIC', 'folder_day2', '2025-07-13 14:45:00',
+          'Viewpoint', 'iphone15pro', fmt='heic', offset_tag='+03:00'),
+    photo('img_village_canon', '_MG_2107.JPG', 'folder_day2', '2025-07-13 16:20:00',
+          'Lakeside village', 'canon', skew=360),
     video('vid_hevc', 'drone_hevc.mp4', 'folder_day2', '2025-07-13 19:55:00', 'Drone (HEVC)',
           codec='hevc', faststart=True, duration=3),
-    video('vid_reindeer_mov', 'IMG_4321.MOV', 'folder_day2', '2025-07-13 21:10:00', 'Reindeer',
+    video('vid_deer_mov', 'IMG_4321.MOV', 'folder_day2', '2025-07-13 21:10:00', 'Deer',
           container='mov', mvhd='2025-07-16T08:00:00Z', apple='2025-07-13T21:10:00+0300',
           duration=3),
-    # ---------------- Day 3 (2025-07-14, Lapland) ----------------
+    # ---------------- Day 3 (2025-07-14, mountains) ----------------
     photo('img_breakfast', 'IMG_1401.JPG', 'folder_day3', '2025-07-14 08:45:00', 'Breakfast',
           'iphone15', offset_tag='+03:00'),
-    video('vid_pxl_husky', 'PXL_20250714_063000123.mp4', 'folder_day3',
-          '2025-07-14 09:30:00.123', 'Husky ride', mvhd='none', duration=2),
-    photo('img_lake', 'IMG_1410.JPG', 'folder_day3', '2025-07-14 11:00:00', 'Lake Inari',
+    video('vid_pxl_bike', 'PXL_20250714_063000123.mp4', 'folder_day3',
+          '2025-07-14 09:30:00.123', 'Bike ride', mvhd='none', duration=2),
+    photo('img_lake', 'IMG_1410.JPG', 'folder_day3', '2025-07-14 11:00:00', 'Mountain lake',
           'iphone15', offset_tag='+03:00'),
-    photo('img_hidden_lapland', 'IMG_1415.JPG', 'folder_day3', '2025-07-14 13:15:00',
-          'Cloudberries (added later)', 'iphone15', offset_tag='+03:00', hidden=True),
+    photo('img_hidden_berries', 'IMG_1415.JPG', 'folder_day3', '2025-07-14 13:15:00',
+          'Berries (added later)', 'iphone15', offset_tag='+03:00', hidden=True),
     video('vid_long_walk', 'long_walk.mp4', 'folder_day3', '2025-07-14 14:30:00',
           'Forest walk (8 s)', duration=8),
-    photo('img_aurora_1', 'IMG_1450.JPG', 'folder_aurora', '2025-07-14 23:40:00',
-          'Midnight sky 1', 'iphone15', offset_tag='+03:00'),
-    photo('img_aurora_canon', '_MG_2203.JPG', 'folder_aurora', '2025-07-14 23:55:00',
-          'Midnight sky (Canon)', 'canon', skew=360),
-    photo('img_aurora_2', 'IMG_1452.JPG', 'folder_aurora', '2025-07-15 00:30:00',
-          'Midnight sky 2', 'iphone15', offset_tag='+03:00'),
-    # ---------------- Day 4 (2025-07-15, Porvoo) + shortcut targets ----------------
-    photo('img_other_kauppatori', 'IMG_5001.JPG', 'folder_other', '2025-07-15 10:15:00',
-          'Kauppatori (via shortcut)', 'iphone14', offset_tag='+03:00', public=True,
+    photo('img_night_sky_1', 'IMG_1450.JPG', 'folder_night_sky', '2025-07-14 23:40:00',
+          'Night sky 1', 'iphone15', offset_tag='+03:00'),
+    photo('img_night_sky_canon', '_MG_2203.JPG', 'folder_night_sky', '2025-07-14 23:55:00',
+          'Night sky (Canon)', 'canon', skew=360),
+    photo('img_night_sky_2', 'IMG_1452.JPG', 'folder_night_sky', '2025-07-15 00:30:00',
+          'Night sky 2', 'iphone15', offset_tag='+03:00'),
+    # ---------------- Day 4 (2025-07-15, old town) + shortcut targets ----------------
+    photo('img_other_market', 'IMG_5001.JPG', 'folder_other', '2025-07-15 10:15:00',
+          'Flower market (via shortcut)', 'iphone14', offset_tag='+03:00', public=True,
           created='2025-07-15T19:30:00.000Z'),
-    photo('img_porvoo', 'IMG_1480.JPG', 'folder_day4', '2025-07-15 11:30:00',
-          'Porvoo old town', 'iphone15', offset_tag='+03:00'),
-    photo('img_extra_porvoo', 'PXL_20250715_100000000.jpg', 'folder_extra',
-          '2025-07-15 13:00:00', 'Porvoo river (shortcut folder)', 'pixel8',
+    photo('img_old_town', 'IMG_1480.JPG', 'folder_day4', '2025-07-15 11:30:00',
+          'Old town', 'iphone15', offset_tag='+03:00'),
+    photo('img_extra_old_town', 'PXL_20250715_100000000.jpg', 'folder_extra',
+          '2025-07-15 13:00:00', 'Old town river (shortcut folder)', 'pixel8',
           offset_tag='+03:00', jfif=True, created='2025-07-15T20:30:00.000Z'),
     photo('img_airport', 'IMG_1501.JPG', 'folder_day4', '2025-07-15 16:45:00',
-          'Helsinki Airport', 'iphone15', offset_tag='+03:00'),
+          'Airport', 'iphone15', offset_tag='+03:00'),
     # ---------------- outside the trip tree ----------------
     photo('img_private_1', 'IMG_2001.JPG', 'folder_private', '2025-07-16 10:00:00',
           'Private A', 'iphone15', offset_tag='+03:00'),
@@ -205,11 +206,11 @@ MEDIA = [
 
 OTHER_ITEMS = [
     dict(kind='text', id='txt_notes', name='notes.txt', parent=ROOT,
-         content='Finland trip 2025 notes\n- Helsinki 12.7.\n- Rovaniemi 13.7.\n'
-                 '- Lapland 14.7.\n- Porvoo 15.7.\nこのファイルはスライドショーに表示されない。\n'),
+         content='Trip 2025 notes\n- Day1 city 12.7.\n- Day2 lake 13.7.\n'
+                 '- Day3 mountains 14.7.\n- Day4 old town 15.7.\nこのファイルはスライドショーに表示されない。\n'),
     dict(kind='gdoc', id='doc_itinerary', name='旅程表 (itinerary)', parent=ROOT),
     dict(kind='shortcut', id='sc_img_other', name='IMG_5001.JPG', parent=ROOT,
-         target='img_other_kauppatori'),
+         target='img_other_market'),
     dict(kind='shortcut', id='sc_folder_extra', name='Extra (shared)', parent=ROOT,
          target='folder_extra'),
 ]
@@ -238,8 +239,8 @@ def parse_local(s: str) -> datetime:
     return datetime.strptime(s, fmt)
 
 
-def hel_to_utc(naive: datetime) -> datetime:
-    return naive.replace(tzinfo=HEL).astimezone(UTC)
+def trip_to_utc(naive: datetime) -> datetime:
+    return naive.replace(tzinfo=TRIP_TZ).astimezone(UTC)
 
 
 def iso_ms(dt: datetime) -> str:
@@ -615,7 +616,7 @@ def time_from_filename(name: str):
         m = (rx.match if rx is not RE_DASHED else rx.search)(name)
         if m:
             y, mo, d, h, mi, s = map(int, m.groups())
-            return hel_to_utc(datetime(y, mo, d, h, mi, s))
+            return trip_to_utc(datetime(y, mo, d, h, mi, s))
     return None
 
 
@@ -634,7 +635,7 @@ def derive_app_time(rec: dict, data: bytes | None, camera_offsets: dict):
     if mime.startswith('image/'):
         if imm.get('time'):
             wall = datetime.strptime(imm['time'], '%Y:%m:%d %H:%M:%S')
-            t = hel_to_utc(wall)
+            t = trip_to_utc(wall)
             return t + timedelta(minutes=camera_offsets.get(model, 0)), 'exif'
         if mime == 'image/jpeg' and data is not None:
             ex = read_exif_head(data[:65536])
@@ -643,7 +644,7 @@ def derive_app_time(rec: dict, data: bytes | None, camera_offsets: dict):
                 if ex['offsetTimeOriginal']:
                     t = (wall - parse_offset(ex['offsetTimeOriginal'])).replace(tzinfo=UTC)
                 else:
-                    t = hel_to_utc(wall)
+                    t = trip_to_utc(wall)
                 return t + timedelta(minutes=camera_offsets.get(ex['model'], 0)), 'exif-range'
     if mime.startswith('video/') and data is not None:
         mp4 = parse_mp4(data)
@@ -789,7 +790,7 @@ def _generate(gen: Gen, tmp: Path):
     for m in media:
         mid, parent = m['id'], m['parent']
         local = parse_local(m['local'])
-        true_utc = hel_to_utc(local)
+        true_utc = trip_to_utc(local)
         title = m['title']
         label = label_for(local, title) if not mid.startswith('big_') else \
             f'{title} {local:%m-%d %H:%M}'
@@ -1164,12 +1165,12 @@ def plan_app_time(m, local, true_utc, rec):
     if m['kind'] == 'photo':
         wall = local + timedelta(minutes=m['skew'])
         if m['camera'] and m['drive_time']:
-            return {'timeSource': 'exif', 'appTimeUtc': hel_to_utc(wall)}
+            return {'timeSource': 'exif', 'appTimeUtc': trip_to_utc(wall)}
         if m['camera'] and m['fmt'] == 'jpeg':
             if m['offset_tag']:
                 t = (wall - parse_offset(m['offset_tag'])).replace(tzinfo=UTC)
             else:
-                t = hel_to_utc(wall)
+                t = trip_to_utc(wall)
             return {'timeSource': 'exif-range', 'appTimeUtc': t}
     else:
         if m['apple']:
@@ -1235,9 +1236,9 @@ def verify_file(rec, data, problems):
             problems.append(f'{rid}: moov must be at the end, beyond the first 256 KiB')
         if rid == 'vid_harbour_ferry' and mp4['moovAtEnd']:
             problems.append(f'{rid}: expected faststart (moov first)')
-        if rid == 'vid_pxl_husky' and mp4['mvhdCreationRaw'] != 0:
+        if rid == 'vid_pxl_bike' and mp4['mvhdCreationRaw'] != 0:
             problems.append(f'{rid}: mvhd creation_time must be 0')
-        if rid == 'vid_reindeer_mov' and mp4['metaLocation'] != 'moov/meta':
+        if rid == 'vid_deer_mov' and mp4['metaLocation'] != 'moov/meta':
             problems.append(f'{rid}: Apple keys must live in moov/meta')
         dur = int(rec['videoMediaMetadata']['durationMillis'])
         if not (1500 <= dur <= 9000):
@@ -1279,7 +1280,7 @@ def make_video(m, dest: Path, tmp: Path, bg, label, true_utc):
         movflags.append('+faststart')
     if m['apple']:
         cmd += ['-fflags', '+bitexact', '-flags:v', '+bitexact', '-flags:a', '+bitexact',
-                '-metadata', 'com.apple.quicktime.location.ISO6709=+66.5436+025.8473+105.000/',
+                '-metadata', 'com.apple.quicktime.location.ISO6709=+37.9838+023.7275+105.000/',
                 '-metadata', 'com.apple.quicktime.make=Apple',
                 '-metadata', 'com.apple.quicktime.model=iPhone 15',
                 '-metadata', 'com.apple.quicktime.software=17.5.1',

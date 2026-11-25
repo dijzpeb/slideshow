@@ -2,7 +2,7 @@
 //
 //   import { startServers } from './harness.mjs';
 //   const env = await startServers({ appPort: 0, drivePort: 0, maxPageSize: 4 });
-//   // env.appUrl, env.driveUrl, env.admin.reveal('img_hidden_lapland'), env.manifest ...
+//   // env.appUrl, env.driveUrl, env.admin.reveal('img_hidden_berries'), env.manifest ...
 //   await env.close();
 //
 // CLI (manual testing):  node tests/e2e/harness.mjs [--app-port 8080] [--drive-port 8787] [--max-page-size 4]
@@ -13,6 +13,7 @@ import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { startMockDrive, adminClient, DEFAULT_FIXTURES_DIR } from '../mock-drive/server.mjs';
+import { addLocalOriginsToCsp, apiBaseOrigin } from '../../scripts/dev-csp.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const APP_ROOT = path.resolve(HERE, '../..');
@@ -56,9 +57,14 @@ const MIME = {
 
 /**
  * Minimal static file server (no cache, directory → index.html, correct MIME types).
+ * HTML pages keep their Content-Security-Policy meta, extended (connect-src, img-src, media-src) with the
+ * loopback origins from `cspOrigins()` and the page's own `?apiBase=` (scripts/dev-csp.mjs), so the app
+ * runs under its production CSP while talking to the local mock.
+ * @param {object} [o]
+ * @param {() => string[]} [o.cspOrigins] extra (loopback) origins for the CSP, e.g. the mock Drive URL
  * @returns {Promise<{url:string, port:number, server:http.Server, close:()=>Promise<void>}>}
  */
-export async function startStaticServer({ root = APP_ROOT, port = 0, host = '127.0.0.1' } = {}) {
+export async function startStaticServer({ root = APP_ROOT, port = 0, host = '127.0.0.1', cspOrigins = () => [] } = {}) {
   const rootAbs = path.resolve(root);
   const server = http.createServer((req, res) => {
     const send = (status, body, type = 'text/plain; charset=utf-8') => {
@@ -89,8 +95,20 @@ export async function startStaticServer({ root = APP_ROOT, port = 0, host = '127
     } catch {
       return send(404, 'Not Found');
     }
+    const ext = path.extname(file).toLowerCase();
+    if (ext === '.html' || ext === '.htm') {
+      let html;
+      try {
+        html = fs.readFileSync(file, 'utf8');
+      } catch {
+        return send(404, 'Not Found');
+      }
+      const body = Buffer.from(addLocalOriginsToCsp(html, [...cspOrigins(), apiBaseOrigin(req.url)].filter(Boolean)));
+      res.writeHead(200, { 'content-type': MIME[ext], 'content-length': body.length, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
+      return res.end(req.method === 'HEAD' ? undefined : body);
+    }
     res.writeHead(200, {
-      'content-type': MIME[path.extname(file).toLowerCase()] || 'application/octet-stream',
+      'content-type': MIME[ext] || 'application/octet-stream',
       'content-length': st.size,
       'cache-control': 'no-store',
       'x-content-type-options': 'nosniff',
@@ -141,8 +159,9 @@ export async function startServers({
   fixturesDir = FIXTURES_DIR, maxPageSize, driveOptions = {},
 } = {}) {
   ensureFixtures({ fixturesDir });
-  const app = await startStaticServer({ root: appRoot, port: appPort, host });
   let drive;
+  // the CSP of index.html is extended with the mock's origin (thumbnails, media) and the page's ?apiBase=
+  const app = await startStaticServer({ root: appRoot, port: appPort, host, cspOrigins: () => (drive ? [drive.url] : []) });
   try {
     drive = await startMockDrive({ port: drivePort, host, fixturesDir, maxPageSize, ...driveOptions });
   } catch (e) {

@@ -157,15 +157,15 @@ test('F6. a folder shortcut whose target cannot be listed is skipped with a warn
   const app = await suite.newApp({ params: ROOT_PARAMS });
   await app.waitForPlayer();
   const ids = await app.itemIds();
-  assert.ok(!ids.includes('img_extra_porvoo'), 'items of the unreadable folder are left out');
-  assertOrder(ids, expectedFor(suite.manifest, 'default', ids).filter((id) => id !== 'img_extra_porvoo'), 'the rest of the folder');
+  assert.ok(!ids.includes('img_extra_old_town'), 'items of the unreadable folder are left out');
+  assertOrder(ids, expectedFor(suite.manifest, 'default', ids).filter((id) => id !== 'img_extra_old_town'), 'the rest of the folder');
   await app.page.waitForFunction(() => window.__toasts.some((x) => x.text.startsWith('アクセスできないフォルダを')), null, { timeout: 10000 });
   assert.ok((await toastTexts(app)).includes('アクセスできないフォルダを 1 件スキップしました'));
   const lists = (await suite.admin.log()).filter((e) => e.path === '/drive/v3/files' && (e.query.q || '').includes("'folder_extra' in parents"));
   assert.ok(lists.some((e) => e.status === 404), 'the target folder was tried');
   // the show plays
-  await app.waitForSlide({ id: 'img_senate_square' }, 20000);
-  await app.waitForSlide({ id: 'img_helsinki_cathedral' }, 20000);
+  await app.waitForSlide({ id: 'img_city_square' }, 20000);
+  await app.waitForSlide({ id: 'img_cathedral' }, 20000);
   assertNoPageErrors(app);
   await app.close();
 })(t));
@@ -213,7 +213,7 @@ test('F7/F14. a refresh that is still running when another folder is started doe
     refreshing: window.__slideshow.refreshing,
   }));
   assert.equal(overwritten, false, `the old refresh changed the new show: ${JSON.stringify(st)} toasts=${await toastTexts(app)}`);
-  assert.deepEqual(st, { root: 'folder_extra', items: ['img_extra_porvoo'], player: ['img_extra_porvoo'], folder: 'folder_extra', refreshing: false });
+  assert.deepEqual(st, { root: 'folder_extra', items: ['img_extra_old_town'], player: ['img_extra_old_town'], folder: 'folder_extra', refreshing: false });
   // refreshing the new folder still works
   await openGrid(app);
   await page.click('#btn-refresh');
@@ -257,15 +257,15 @@ test('F1. time corrections are saved per folder and travel in the share link', {
   assert.deepEqual(u.searchParams.getAll('fix'), ['-360:Canon EOS R6', '*'], 'fix=*: the complete set of corrections of the folder');
 
   // another folder with the same camera is not corrected
-  await page.fill('#f-folder', 'folder_aurora');
+  await page.fill('#f-folder', 'folder_night_sky');
   await page.click('#btn-start');
   await app.waitForPlayer();
-  await page.waitForFunction(() => window.__slideshow.root?.id === 'folder_aurora');
-  const aurora = await app.items();
-  assert.deepEqual(aurora.map((i) => i.id), ['img_aurora_1', 'img_aurora_2', 'img_aurora_canon'], 'uncorrected order in folder_aurora');
-  const canon = aurora.find((i) => i.id === 'img_aurora_canon');
+  await page.waitForFunction(() => window.__slideshow.root?.id === 'folder_night_sky');
+  const nightSky = await app.items();
+  assert.deepEqual(nightSky.map((i) => i.id), ['img_night_sky_1', 'img_night_sky_2', 'img_night_sky_canon'], 'uncorrected order in folder_night_sky');
+  const canon = nightSky.find((i) => i.id === 'img_night_sky_canon');
   assert.equal(canon.offsetMinutes, 0);
-  assert.equal(canon.iso, suite.byId.img_aurora_canon._test.expected.appTimeUtcDefault);
+  assert.equal(canon.iso, suite.byId.img_night_sky_canon._test.expected.appTimeUtcDefault);
   await openGrid(app);
   await page.click('#time-fix summary');
   const vals = await page.locator('#time-fix-table .fix-row[data-group="Canon EOS R6"] input').evaluateAll((els) => els.map((e) => e.value));
@@ -325,7 +325,7 @@ test('F0. a correction for a camera does not apply to its times recorded with an
   const groups = await page.$$eval('#time-fix-table .fix-row', (rows) => rows.map((r) => r.dataset.group));
   assert.ok(groups.includes(`SONY ILCE-7M4${ZONED}`), `groups: ${groups}`);
   const notes = await page.$$eval('#time-fix-table p', (els) => els.map((e) => e.textContent));
-  assert.match(notes[0], /^撮影地のタイムゾーン: Europe\/Helsinki/);
+  assert.match(notes[0], /^撮影地のタイムゾーン: Europe\/Athens/);
   assert.ok(notes.some((n) => n.includes(`「${ZONED}」のグループは`)), `notes: ${notes}`);
   const sonyVals = await page.locator(`#time-fix-table .fix-row[data-group="SONY ILCE-7M4${ZONED}"] input`).evaluateAll((els) => els.map((e) => e.value));
   assert.deepEqual(sonyVals, ['0', '0']);
@@ -489,7 +489,7 @@ test('R3. 適用 keeps the saved corrections of groups that are not listed yet (
   let release;
   let held = 0;
   const gate = new Promise((r) => (release = r));
-  await app.context.route(/\/drive\/v3\/files\/img_other_kauppatori\?/, async (route) => {
+  await app.context.route(/\/drive\/v3\/files\/img_other_market\?/, async (route) => {
     if (route.request().headers().range) {
       held++;
       await gate;
@@ -499,8 +499,8 @@ test('R3. 適用 keeps the saved corrections of groups that are not listed yet (
   await app.goto();
   await app.waitForPlayer();
   for (let i = 0; i < 200 && !held; i++) await sleep(100);
-  assert.ok(held, 'the EXIF read of img_other_kauppatori is waiting');
-  const it0 = (await app.items()).find((i) => i.id === 'img_other_kauppatori');
+  assert.ok(held, 'the EXIF read of img_other_market is waiting');
+  const it0 = (await app.items()).find((i) => i.id === 'img_other_market');
   assert.deepEqual([it0.group, it0.offsetMinutes], ['Apple iPhone 14', 0], 'not refined yet');
   await openGrid(app);
   await page.click('#time-fix summary');
@@ -517,8 +517,8 @@ test('R3. 適用 keeps the saved corrections of groups that are not listed yet (
   assert.deepEqual((await storedSettings(app)).cameraOffsets, { folder_root: { [IPHONE_ZONED]: 30, 'Canon EOS R6': -50 } });
   // once the EXIF is read, the photo gets its correction
   release();
-  await page.waitForFunction(() => window.__slideshow.items.find((i) => i.id === 'img_other_kauppatori')?.timeSource === 'exif-offset', null, { timeout: 30000 });
-  const it1 = (await app.items()).find((i) => i.id === 'img_other_kauppatori');
+  await page.waitForFunction(() => window.__slideshow.items.find((i) => i.id === 'img_other_market')?.timeSource === 'exif-offset', null, { timeout: 30000 });
+  const it1 = (await app.items()).find((i) => i.id === 'img_other_market');
   assert.deepEqual([it1.group, it1.offsetMinutes], [IPHONE_ZONED, 30]);
   // a row set to 0 removes that correction
   await page.waitForSelector(`#time-fix-table .fix-row[data-group="${IPHONE_ZONED}"]`);
@@ -543,8 +543,8 @@ test('R4. corrections saved by the previous version keep applying to the videos 
   assert.equal(byId.vid_harbour_ferry.group, '動画（機種不明）');
   assert.equal(byId.vid_harbour_ferry.offsetMinutes, -180);
   // the iPhone video was in its camera group before too; the Pixel file name is UTC (its own zoned group)
-  assert.equal(byId.vid_reindeer_mov.offsetMinutes, 0);
-  assert.equal(byId.vid_pxl_husky.offsetMinutes, 0);
+  assert.equal(byId.vid_deer_mov.offsetMinutes, 0);
+  assert.equal(byId.vid_pxl_bike.offsetMinutes, 0);
   const st = await page.evaluate(() => ({ co: window.__slideshow.settings.cameraOffsets, legacy: window.__slideshow.settings.legacyCameraOffsets }));
   assert.deepEqual(st, { co: { folder_root: { '動画（機種不明）': -180, 'スマートフォン動画（ファイル名から推定）': -180 } }, legacy: {} });
   // the time-fix table shows it, and 適用 saves it in the new format
@@ -597,20 +597,20 @@ test('R6. a tile picked while a video is paused under the grid: the old video is
   await page.evaluate(() => window.__slideshow.loader.clear());
   await suite.admin.setLatency(7000);
   try {
-    await page.click('#grid-body .tile[data-id="img_porvoo"]');
+    await page.click('#grid-body .tile[data-id="img_old_town"]');
     await page.waitForSelector('#grid-overlay', { state: 'hidden' });
     await sleep(5500); // longer than the paused-video watchdog (3 s + 1 s tick)
     const st = await longWalk(page);
     assert.equal(st.playing, true, 'the show plays from the picked tile');
-    assert.equal(st.key, 'media:img_porvoo');
+    assert.equal(st.key, 'media:img_old_town');
     assert.equal(st.paused, true, `the old video stays paused: ${JSON.stringify(st)}`);
     assert.ok(Math.abs(st.t - t0) < 0.2, `old video did not advance (${t0} → ${st.t})`);
   } finally {
     await suite.admin.setLatency(0);
   }
-  await app.waitForSlide({ id: 'img_porvoo' }, 30000);
+  await app.waitForSlide({ id: 'img_old_town' }, 30000);
   const log = (await app.slideLog()).map(slideKey);
-  assert.equal(log[log.indexOf('media:vid_long_walk') + 1], 'media:img_porvoo', `slides: ${log.slice(-4)}`);
+  assert.equal(log[log.indexOf('media:vid_long_walk') + 1], 'media:img_old_town', `slides: ${log.slice(-4)}`);
   assertNoPageErrors(app);
   await app.close();
 })(t));
@@ -637,7 +637,11 @@ test('R7. → near the end of a video while the next slide loads slowly: the vid
   } finally {
     await suite.admin.setLatency(0);
   }
-  await app.waitForLog("(e) => e.t > 0 && (e.kind !== 'video' || e.id !== 'vid_long_walk') && window.__slideLog.indexOf(e) > window.__slideLog.findIndex((x) => x.id === 'vid_long_walk')", 30000);
+  // a slide other than vid_long_walk recorded after it
+  await app.waitForLog((log) => {
+    const k = log.findIndex((x) => x.id === 'vid_long_walk');
+    return log.some((e, i) => e.t > 0 && (e.kind !== 'video' || e.id !== 'vid_long_walk') && i > k);
+  }, 30000);
   const log = (await app.slideLog()).map(slideKey);
   assert.equal(log[log.lastIndexOf('media:vid_long_walk') + 1], next, `slides: ${log.slice(-4)}`);
   assertNoPageErrors(app);
@@ -649,14 +653,14 @@ test('R8. a refresh that removes the slide being loaded: when its load fails, th
   const app = await suite.newApp({ params: PLAYER_PARAMS, settings: PLAYER_SETTINGS });
   const { page } = app;
   await app.waitForPlayer();
-  await page.evaluate(() => window.__slideshow.player.goToItem('img_aurora_2', { play: true }));
-  await app.waitForSlide({ id: 'img_aurora_2' });
+  await page.evaluate(() => window.__slideshow.player.goToItem('img_night_sky_2', { play: true }));
+  await app.waitForSlide({ id: 'img_night_sky_2' });
   const keys = await page.evaluate(() => window.__slideshow.player.slides.map((s) => s.key));
-  const at = keys.indexOf('media:img_porvoo');
-  assert.equal(keys[at + 1], 'media:img_extra_porvoo', 'fixture order');
-  // img_porvoo was deleted in Drive but is still listed; the player goes to it
+  const at = keys.indexOf('media:img_old_town');
+  assert.equal(keys[at + 1], 'media:img_extra_old_town', 'fixture order');
+  // img_old_town was deleted in Drive but is still listed; the player goes to it
   await page.evaluate(() => window.__slideshow.loader.clear());
-  await suite.admin.remove('img_porvoo');
+  await suite.admin.remove('img_old_town');
   await suite.admin.setLatency(1500);
   try {
     await page.evaluate((i) => {
@@ -666,17 +670,17 @@ test('R8. a refresh that removes the slide being loaded: when its load fails, th
     // the refresh lands while the deleted photo is still loading
     const mid = await page.evaluate(() => {
       const s = window.__slideshow;
-      s.player.setItems(s.items.filter((it) => it.id !== 'img_porvoo'));
+      s.player.setItems(s.items.filter((it) => it.id !== 'img_old_town'));
       const p = s.player;
       return { key: p.slides[p.index]?.key, detached: p.detached };
     });
-    assert.deepEqual(mid, { key: 'media:img_extra_porvoo', detached: true });
+    assert.deepEqual(mid, { key: 'media:img_extra_old_town', detached: true });
   } finally {
     await suite.admin.setLatency(0);
   }
-  await page.waitForFunction(() => window.__slideLog.some((e) => e.id === 'img_extra_porvoo' || e.id === 'img_airport'), null, { timeout: 60000 });
+  await page.waitForFunction(() => window.__slideLog.some((e) => e.id === 'img_extra_old_town' || e.id === 'img_airport'), null, { timeout: 60000 });
   const log = (await app.slideLog()).map(slideKey);
-  assert.equal(log[log.length - 1], 'media:img_extra_porvoo', `slides: ${log.slice(-3)}`);
+  assert.equal(log[log.length - 1], 'media:img_extra_old_town', `slides: ${log.slice(-3)}`);
   assertNoPageErrors(app);
   await app.close();
 })(t));

@@ -2,7 +2,7 @@
 
 export const GIS_SRC = 'https://accounts.google.com/gsi/client';
 export const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive.readonly';
-const TOKEN_KEY = 'finland-slideshow.token.v1';
+const TOKEN_KEY = 'photo-slideshow.token.v1';
 /** 期限のこれだけ前からトークンは無効扱い（signedIn と accessToken で同じ基準） */
 const TOKEN_MARGIN_MS = 60000;
 /** ログインのポップアップが応答しないときに諦めるまでの時間 */
@@ -62,12 +62,18 @@ export class OAuthSession extends EventTarget {
     this._schedule();
   }
 
+  /**
+   * このタブに保存したトークンを読み込む。期限切れのものも持っておく（hasToken。開き直したタブでも
+   * 「ログアウト」で消せるように）。使えるかどうかは accessToken / signedIn で判断する
+   */
   _restore() {
     try {
       const raw = sessionStorage.getItem(TOKEN_KEY);
       if (!raw) return null;
       const t = JSON.parse(raw);
-      if (t && t.clientId === this.clientId && t.accessToken && t.expiresAt > Date.now() + TOKEN_MARGIN_MS) return t;
+      if (t && t.clientId === this.clientId && typeof t.accessToken === 'string' && t.accessToken && Number.isFinite(t.expiresAt)) {
+        return { accessToken: t.accessToken, expiresAt: t.expiresAt, clientId: t.clientId };
+      }
     } catch {
       /* ignore */
     }
@@ -93,12 +99,18 @@ export class OAuthSession extends EventTarget {
     // setTimeout の上限（約 24.8 日）を超えないよう念のため制限
     const clamp = (ms) => Math.min(Math.max(0, ms), 2 ** 31 - 1);
     if (warnAt > now) this.timers.push(setTimeout(() => this.dispatchEvent(new Event('expiring')), clamp(warnAt - now)));
-    this.timers.push(setTimeout(() => this.dispatchEvent(new Event('expired')), clamp(exp - now)));
+    // 読み込んだ時点ですでに期限切れのトークン（タブを開き直したときなど）は、改めて知らせない
+    if (exp > now) this.timers.push(setTimeout(() => this.dispatchEvent(new Event('expired')), clamp(exp - now)));
   }
 
   /** 使えるトークンがある（accessToken と同じ基準） */
   get signedIn() {
     return !!this.accessToken;
+  }
+
+  /** トークンを持っている（期限切れのものも含む。ログアウトで消すものがある） */
+  get hasToken() {
+    return !!this.tokenData;
   }
 
   /** トークンがあと ms ミリ秒以上有効か */

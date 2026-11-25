@@ -4,7 +4,7 @@ import { RangeReader, extractCaptureInfo } from './mediatime.js';
 import { extractionPhase, fileSignature } from './catalog.js';
 import { mapLimit, AuthRequiredError, normalizeMimeType } from './drive.js';
 
-const CACHE_KEY = 'finland-slideshow.meta.v1';
+const CACHE_KEY = 'photo-slideshow.meta.v1';
 const CACHE_MAX = 5000;
 // 解析処理を変えたら上げる（古い解析結果は読み直す）。2: 動画の機種名（Android / Canon）、EXIF の時差タグの選び方
 const PARSER_VERSION = 2;
@@ -42,6 +42,16 @@ function saveCache(cache) {
     }
   }
   return cache;
+}
+
+/** このブラウザに撮影日時の解析結果が残っているか（ログアウトで消すものがあるか） */
+export function hasMetaCache() {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY);
+    return !!raw && raw.trim() !== '{}';
+  } catch {
+    return false;
+  }
 }
 
 export function clearMetaCache() {

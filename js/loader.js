@@ -1,6 +1,6 @@
 // 写真・動画の読み込み（Service Worker 経由のストリーミング、Blob、HEIC 変換、サムネイル）
 
-import { AuthRequiredError } from './drive.js';
+import { AuthRequiredError, safeMediaType, prefersThumbnail } from './drive.js';
 import { RangeReader, readJpegExifThumbnail } from './mediatime.js';
 
 // HEIC を表示できないブラウザ（Safari 以外）向けの変換ライブラリ（js/vendor/ に同梱）。必要になったときだけ読み込む
@@ -26,6 +26,20 @@ function withTimeout(promise, ms) {
   });
 }
 
+/** このアプリの Service Worker のスクリプトの URL（ページと同じ場所の sw.js） */
+export function appServiceWorkerUrl(baseUrl = location.href) {
+  return new URL('sw.js', baseUrl).href;
+}
+
+/**
+ * メッセージの送り主がこのアプリの Service Worker か。同じオリジンの別のアプリ（同じ github.io の別リポジトリなど）の
+ * Service Worker も、制御していないページにメッセージを送れるため、それに接続情報を渡したり、
+ * トークンを捨てさせたり（force）しない
+ */
+export function isOwnServiceWorker(source, baseUrl = location.href) {
+  return typeof ServiceWorker !== 'undefined' && source instanceof ServiceWorker && source.scriptURL === appServiceWorkerUrl(baseUrl);
+}
+
 /** Service Worker を登録し、ページを制御下に置く。使えない環境では null */
 export async function setupServiceWorker({ getCreds, timeoutMs = 4000 } = {}) {
   if (!('serviceWorker' in navigator) || !window.isSecureContext) return null;
@@ -34,6 +48,7 @@ export async function setupServiceWorker({ getCreds, timeoutMs = 4000 } = {}) {
     container.addEventListener('message', async (event) => {
       const data = event.data || {};
       if (data.type !== 'need-creds' || !event.ports || !event.ports[0]) return;
+      if (!isOwnServiceWorker(event.source)) return;
       let creds = null;
       try {
         creds = await getCreds(!!data.force, data.failedToken || null);
@@ -324,8 +339,12 @@ export class MediaLoader {
   async _loadImage(item, signal) {
     const settings = this.getSettings();
     const errors = [];
-    // 高速モード: Google が生成した縮小画像を使う（HEIC も JPEG で返ってくる）
-    if (settings.imageQuality === 'fast' && item.thumbnailLink && !this.thumbFailed) {
+    // 高速モード: Google が生成した縮小画像を使う（HEIC も JPEG で返ってくる）。
+    // ブラウザが表示できない形式（カメラの RAW など）も、大きな元ファイルをダウンロードせずに縮小画像を使う
+    const thumbFirst = settings.imageQuality === 'fast' || prefersThumbnail(item.mimeType);
+    let triedThumb = false;
+    if (thumbFirst && item.thumbnailLink && !this.thumbFailed) {
+      triedThumb = true;
       try {
         return await this._loadThumbnail(item, signal);
       } catch (e) {
@@ -374,7 +393,7 @@ export class MediaLoader {
       }
     }
     // 最後の手段: サムネイル
-    if (item.thumbnailLink && settings.imageQuality !== 'fast') {
+    if (item.thumbnailLink && settings.imageQuality !== 'fast' && !triedThumb) {
       try {
         return await this._loadThumbnail(item, signal);
       } catch (e) {
@@ -462,7 +481,9 @@ export class MediaLoader {
   async _fetchBlob(item, { signal } = {}) {
     if (item.resourceKey) this.drive.rememberResourceKey(item.id, item.resourceKey);
     const res = await this.drive.fetchMedia(item.id, { signal, retries: PHOTO_RETRIES });
-    return res.blob();
+    const blob = await res.blob();
+    // 応答の Content-Type をそのまま Blob URL に使わない（SVG などとして開かれないよう、安全な型に付け替える）
+    return new Blob([blob], { type: safeMediaType(res.headers.get('content-type'), item.mimeType) });
   }
 
   /**
@@ -473,8 +494,11 @@ export class MediaLoader {
     if (item.size && item.size > maxBytes) throw new Error('動画が大きすぎるため、このブラウザでは再生できません');
     const res = await this.drive.fetchMedia(item.id, { signal });
     const total = Number(res.headers.get('content-length')) || item.size || 0;
+    // QuickTime (.mov) の H.264 動画は MP4 として扱えば Chrome / Firefox でも再生できることが多い（sw.js と同じ）
+    const t = safeMediaType(res.headers.get('content-type'), item.mimeType);
+    const type = t === 'video/quicktime' ? 'video/mp4' : t;
     if (!res.body || !onProgress) {
-      const blob = await res.blob();
+      const blob = new Blob([await res.blob()], { type });
       const url = URL.createObjectURL(blob);
       return { url, revoke: () => URL.revokeObjectURL(url) };
     }
@@ -492,7 +516,7 @@ export class MediaLoader {
       }
       onProgress(total ? got / total : 0);
     }
-    const blob = new Blob(chunks, { type: item.mimeType === 'video/quicktime' ? 'video/mp4' : item.mimeType });
+    const blob = new Blob(chunks, { type });
     const url = URL.createObjectURL(blob);
     return { url, revoke: () => URL.revokeObjectURL(url) };
   }

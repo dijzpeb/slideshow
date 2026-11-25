@@ -12,9 +12,35 @@ import {
   withoutLegacyOffsets,
   saveSettings,
   DEFAULTS,
+  authLock,
+  applyAuthLock,
+  linkAuthConflict,
+  updateStoredSettings,
+  withFolderOffsetsFrom,
 } from '../../js/settings.js';
+import { deviceTimeZone } from '../../js/timeutil.js';
 
 const FOLDER = '1AbCdEfGhIjKlMnOpQrStUvWxYz012345';
+
+/** localStorage stand-in that keeps what is written (raw JSON text in .data) */
+function withMemStorage(stored, fn) {
+  const mem = { data: stored == null ? null : JSON.stringify(stored) };
+  global.localStorage = {
+    getItem: () => mem.data,
+    setItem: (k, v) => {
+      mem.data = v;
+    },
+    removeItem: () => {
+      mem.data = null;
+    },
+  };
+  try {
+    fn(mem);
+    return mem.data == null ? null : JSON.parse(mem.data);
+  } finally {
+    delete global.localStorage;
+  }
+}
 
 function withStorage(stored, fn) {
   global.localStorage = { getItem: () => (stored == null ? null : JSON.stringify(stored)), setItem() {}, removeItem() {} };
@@ -211,4 +237,155 @@ test('loadSettings migrates the previous flat cameraOffsets to the folder saved 
   // 新しい形式だけなら何もしない
   const fresh = { folder: 'A', cameraOffsets: { A: { cam: 30 } } };
   assert.equal(migrateStoredOffsets(fresh), fresh);
+});
+
+test('the default trip time zone is the device time zone; config.js, storage and the URL override it', () => {
+  assert.equal(DEFAULTS.timeZone, deviceTimeZone());
+  assert.equal(withStorage(null, () => loadSettings({}, '')).timeZone, DEFAULTS.timeZone);
+  // config.js の空欄は既定値（この端末のタイムゾーン）
+  assert.equal(withStorage(null, () => loadSettings({ timeZone: '' }, '')).timeZone, DEFAULTS.timeZone);
+  assert.equal(withStorage(null, () => loadSettings({ timeZone: 'Europe/Paris' }, '')).timeZone, 'Europe/Paris');
+  assert.equal(withStorage({ timeZone: 'Asia/Tokyo' }, () => loadSettings({ timeZone: 'Europe/Paris' }, '')).timeZone, 'Asia/Tokyo');
+  assert.equal(withStorage({ timeZone: 'Asia/Tokyo' }, () => loadSettings({}, '?tz=America/New_York')).timeZone, 'America/New_York');
+  // 不正な値は既定値に戻す
+  assert.equal(sanitize({ timeZone: 'Mars/Olympus' }).timeZone, DEFAULTS.timeZone);
+  // 共有リンクには既定値でも必ず付ける
+  assert.equal(new URL(buildShareUrl('https://x.github.io/slideshow/', sanitize({ folder: FOLDER }))).searchParams.get('tz'), DEFAULTS.timeZone);
+});
+
+const CONFIG_CLIENT = '111-config.apps.googleusercontent.com';
+const EVIL_CLIENT = '666-attacker.apps.googleusercontent.com';
+
+test('config.js clientId locks the connection: URL / stored clientId, key and mode are ignored', () => {
+  const lock = authLock({ clientId: ` ${CONFIG_CLIENT} ` });
+  assert.deepEqual({ ...lock, values: { ...lock.values } }, { clientId: true, apiKey: false, any: true, authMode: 'oauth', values: { clientId: CONFIG_CLIENT, apiKey: '' } });
+  const stored = { clientId: 'stored-evil', apiKey: 'STOREDKEY', authMode: 'apikey', folder: 'F1' };
+  for (const search of [`?clientId=${EVIL_CLIENT}`, `?clientId=${EVIL_CLIENT}&mode=apikey&key=EVILKEY`, '?key=EVILKEY', '?apiKey=EVILKEY&mode=key', '']) {
+    const s = withStorage(stored, () => loadSettings({ clientId: CONFIG_CLIENT }, search));
+    assert.equal(s.clientId, CONFIG_CLIENT, search);
+    assert.equal(s.authMode, 'oauth', search);
+    assert.equal(s.apiKey, '', search);
+  }
+  // the other settings still come from storage / the URL
+  assert.equal(withStorage(stored, () => loadSettings({ clientId: CONFIG_CLIENT }, '?folder=F2')).folder, 'F2');
+  // a form edited in the page cannot override it either
+  assert.deepEqual(applyAuthLock({ authMode: 'apikey', clientId: EVIL_CLIENT, apiKey: 'K', folder: 'F' }, lock), { authMode: 'oauth', clientId: CONFIG_CLIENT, apiKey: '', folder: 'F' });
+});
+
+test('config.js apiKey only → API-key mode with that key; both → mode selectable, values locked; none → unlocked', () => {
+  const stored = { clientId: 'stored-client', apiKey: 'STOREDKEY', authMode: 'oauth' };
+  const k = withStorage(stored, () => loadSettings({ apiKey: 'CONFIGKEY' }, `?mode=oauth&clientId=${EVIL_CLIENT}&key=EVILKEY`));
+  assert.deepEqual([k.authMode, k.apiKey, k.clientId], ['apikey', 'CONFIGKEY', '']);
+  const both = { clientId: CONFIG_CLIENT, apiKey: 'CONFIGKEY' };
+  assert.equal(authLock(both).authMode, null);
+  const b1 = withStorage(stored, () => loadSettings(both, `?mode=apikey&key=EVILKEY&clientId=${EVIL_CLIENT}`));
+  assert.deepEqual([b1.authMode, b1.apiKey, b1.clientId], ['apikey', 'CONFIGKEY', CONFIG_CLIENT]);
+  const b2 = withStorage(stored, () => loadSettings(both, ''));
+  assert.deepEqual([b2.authMode, b2.apiKey, b2.clientId], ['oauth', 'CONFIGKEY', CONFIG_CLIENT]);
+  // config.js authMode is the default when both are set
+  assert.equal(withStorage(null, () => loadSettings({ ...both, authMode: 'apikey' }, '')).authMode, 'apikey');
+  // unlocked (empty config.js): the share-link feature keeps working
+  assert.equal(authLock({ clientId: '', apiKey: '  ' }).any, false);
+  const u = withStorage(null, () => loadSettings({ clientId: '', apiKey: '' }, `?clientId=${EVIL_CLIENT}`));
+  assert.equal(u.clientId, EVIL_CLIENT);
+  const v = withStorage(null, () => loadSettings({}, '?key=LINKKEY'));
+  assert.deepEqual([v.authMode, v.apiKey], ['apikey', 'LINKKEY']);
+});
+
+test('share link: connection values locked by config.js are left out (the recipient uses the deployed config)', () => {
+  const s = sanitize({ folder: FOLDER, authMode: 'oauth', clientId: CONFIG_CLIENT, apiKey: '', timeZone: 'Europe/Paris' });
+  const params = (u) => Object.fromEntries([...new URL(u).searchParams].filter(([k]) => ['mode', 'clientId', 'key'].includes(k)));
+  assert.deepEqual(params(buildShareUrl('https://x.github.io/s/', s, authLock({ clientId: CONFIG_CLIENT }))), {});
+  const k = sanitize({ folder: FOLDER, authMode: 'apikey', apiKey: 'CONFIGKEY' });
+  assert.deepEqual(params(buildShareUrl('https://x.github.io/s/', k, authLock({ apiKey: 'CONFIGKEY' }))), {});
+  // both set: the mode is still shared, the values are not
+  const both = authLock({ clientId: CONFIG_CLIENT, apiKey: 'CONFIGKEY' });
+  assert.deepEqual(params(buildShareUrl('https://x.github.io/s/', { ...k, clientId: CONFIG_CLIENT }, both)), { mode: 'apikey' });
+  // unlocked: unchanged (mode + value)
+  assert.deepEqual(params(buildShareUrl('https://x.github.io/s/', s)), { mode: 'oauth', clientId: CONFIG_CLIENT });
+  assert.deepEqual(params(buildShareUrl('https://x.github.io/s/', k, authLock({}))), { mode: 'apikey', key: 'CONFIGKEY' });
+});
+
+test('linkAuthConflict: a link clientId / key that differs from a non-empty stored one (unlocked deployments only)', () => {
+  const stored = { authMode: 'apikey', apiKey: 'MYKEY', clientId: 'my-client' };
+  const c = withStorage(stored, () => linkAuthConflict({}, '?key=OTHERKEY&folder=F'));
+  assert.deepEqual(c, { clientId: false, apiKey: true, stored: { authMode: 'apikey', clientId: 'my-client', apiKey: 'MYKEY' } });
+  assert.equal(withStorage(stored, () => linkAuthConflict({}, `?clientId=${EVIL_CLIENT}`)).clientId, true);
+  // same values, nothing stored, or no auth value in the link → no warning
+  assert.equal(withStorage(stored, () => linkAuthConflict({}, '?key=MYKEY&clientId=my-client')), null);
+  assert.equal(withStorage(null, () => linkAuthConflict({}, '?key=OTHERKEY')), null);
+  assert.equal(withStorage({ apiKey: '' }, () => linkAuthConflict({}, '?key=OTHERKEY')), null);
+  assert.equal(withStorage(stored, () => linkAuthConflict({}, '?folder=F&mode=oauth')), null);
+  // locked by config.js: the link value is ignored anyway
+  assert.equal(withStorage(stored, () => linkAuthConflict({ apiKey: 'CONFIGKEY' }, '?key=OTHERKEY')), null);
+});
+
+test('linkAuthConflict: a link that switches the connection mode and brings the other value is flagged too', () => {
+  // only an API key saved; the link switches to OAuth with its own client (no saved client ID to compare with)
+  const keyOnly = { authMode: 'apikey', apiKey: 'TESTKEY' };
+  assert.deepEqual(withStorage(keyOnly, () => linkAuthConflict({}, `?mode=oauth&clientId=${EVIL_CLIENT}&folder=F`)), {
+    clientId: true, apiKey: false, stored: { authMode: 'apikey', clientId: '', apiKey: 'TESTKEY' },
+  });
+  // only an OAuth client saved; the link brings an API key (which implies API-key mode)
+  const clientOnly = { authMode: 'oauth', clientId: 'my-client' };
+  assert.deepEqual(withStorage(clientOnly, () => linkAuthConflict({}, '?key=ATTACKERKEY&folder=F&autostart=1')), {
+    clientId: false, apiKey: true, stored: { authMode: 'oauth', clientId: 'my-client', apiKey: '' },
+  });
+  // switching the mode alone (to a value this browser saved itself) is not a conflict
+  const both = { authMode: 'oauth', clientId: 'my-client', apiKey: 'MYKEY' };
+  assert.equal(withStorage(both, () => linkAuthConflict({}, '?mode=apikey')), null);
+  assert.equal(withStorage(keyOnly, () => linkAuthConflict({}, '?mode=oauth')), null);
+  // the app's own share link for the saved connection: no warning
+  assert.equal(withStorage(clientOnly, () => linkAuthConflict({}, '?mode=oauth&clientId=my-client&folder=F')), null);
+  // only a mode (or other settings) saved: nothing to protect, the link is used as before
+  assert.equal(withStorage({ authMode: 'apikey', videoMuted: true }, () => linkAuthConflict({}, `?mode=oauth&clientId=${EVIL_CLIENT}`)), null);
+});
+
+test('config.js with both values: a link ?key= is ignored entirely (it does not pick API-key mode); mode= still does', () => {
+  const both = { clientId: CONFIG_CLIENT, apiKey: 'AIzaCONFIGKEY123' };
+  const s = withStorage(null, () => loadSettings(both, '?key=EVIL'));
+  assert.deepEqual([s.authMode, s.apiKey, s.clientId], ['oauth', 'AIzaCONFIGKEY123', CONFIG_CLIENT]);
+  const viaMode = withStorage(null, () => loadSettings(both, '?key=EVIL&mode=apikey'));
+  assert.deepEqual([viaMode.authMode, viaMode.apiKey], ['apikey', 'AIzaCONFIGKEY123']);
+  // a saved mode still applies
+  assert.equal(withStorage({ authMode: 'apikey' }, () => loadSettings(both, '?key=EVIL')).authMode, 'apikey');
+  // unlocked: ?key= alone still means API-key mode
+  assert.equal(withStorage(null, () => loadSettings({}, '?key=LINKKEY')).authMode, 'apikey');
+});
+
+test('updateStoredSettings: only the changed fields are merged into the stored settings (no URL-only values)', () => {
+  // an autostart link with someone else's folder / title / key, then M (videoMuted) is pressed
+  const stored = { folder: 'MINE', title: 'Mine', photoSeconds: 3 };
+  const search = '?folder=THEIRS&title=Theirs&key=THEIRKEY&tz=Asia%2FTokyo&autostart=1';
+  const after = withMemStorage(stored, () => {
+    const s = loadSettings({}, search);
+    assert.equal(s.folder, 'THEIRS');
+    updateStoredSettings({ videoMuted: !s.videoMuted });
+  });
+  assert.deepEqual(after, { folder: 'MINE', title: 'Mine', photoSeconds: 3, videoMuted: true });
+  // nothing stored yet: only the patch (no defaults filled in, e.g. no device time zone)
+  assert.deepEqual(withMemStorage(null, () => updateStoredSettings({ videoMuted: true })), { videoMuted: true });
+  // values are still validated
+  assert.deepEqual(withMemStorage(null, () => updateStoredSettings({ photoSeconds: 999 })), { photoSeconds: 120 });
+  // a function patch gets the stored settings (older flat corrections migrated to the folder saved with them)
+  const old = { folder: 'A', cameraOffsets: { cam: 15 } };
+  const migrated = withMemStorage(old, () => updateStoredSettings((st) => ({ ...st, title: 'T' })));
+  assert.deepEqual(migrated.cameraOffsets, { A: { cam: 15 } });
+  assert.equal(migrated.title, 'T');
+});
+
+test('withFolderOffsetsFrom copies only that folder\'s corrections (time-fix 適用 persists nothing else)', () => {
+  const stored = { folder: 'MINE', cameraOffsets: { OTHER: { cam: 5 }, F: { old: 1 } }, legacyCameraOffsets: { F: { x: 2 }, G: { y: 3 } } };
+  const current = sanitize({ folder: 'F', title: 'From a link', apiKey: 'LINKKEY', cameraOffsets: { F: { 'Canon EOS R6': -360 }, H: { z: 9 } } });
+  const next = withFolderOffsetsFrom(stored, current, 'F');
+  assert.deepEqual(next.cameraOffsets, { OTHER: { cam: 5 }, F: { 'Canon EOS R6': -360 } });
+  assert.deepEqual(next.legacyCameraOffsets, { G: { y: 3 } });
+  assert.equal(next.folder, 'MINE');
+  assert.equal(next.title, undefined);
+  assert.equal(next.apiKey, undefined);
+  // removing every correction of the folder
+  assert.deepEqual(withFolderOffsetsFrom(stored, sanitize({}), 'F').cameraOffsets, { OTHER: { cam: 5 } });
+  // legacy corrections not migrated yet are kept
+  const withLegacy = sanitize({ legacyCameraOffsets: { F: { x: 4 } } });
+  assert.deepEqual(withFolderOffsetsFrom(stored, withLegacy, 'F').legacyCameraOffsets, { G: { y: 3 }, F: { x: 4 } });
 });

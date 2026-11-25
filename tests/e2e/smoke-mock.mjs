@@ -84,7 +84,7 @@ await check('manifest: oracle orders are consistent', () => {
   for (const id of manifest.expectedOrderWithReveal) assert.equal(byId[id]._test.expected.include, true, id);
   const times = manifest.expectedOrderDefault.map((id) => byId[id]._test.expected.appTimeUtcDefault);
   assert.deepEqual([...times].sort(), times);
-  assert.deepEqual(manifest.hiddenIds.sort(), ['img_hidden_lapland', 'img_hidden_rovaniemi']);
+  assert.deepEqual(manifest.hiddenIds.sort(), ['img_hidden_berries', 'img_hidden_lunch']);
 });
 
 // ---------------------------------------------------------------- auth
@@ -96,7 +96,7 @@ await check('auth: no credentials → 403 dailyLimitExceededUnreg', async () => 
   assert.equal(json.error.errors[0].reason, 'dailyLimitExceededUnreg');
 });
 await check('auth: invalid bearer → 401 + www-authenticate (exposed)', async () => {
-  const { status, json, headers } = await api('/drive/v3/files/img_senate_square', {}, { headers: { authorization: 'Bearer nope' } });
+  const { status, json, headers } = await api('/drive/v3/files/img_city_square', {}, { headers: { authorization: 'Bearer nope' } });
   assert.equal(status, 401);
   assert.match(headers.get('www-authenticate'), /^Bearer /);
   assert.equal(json.error.status, 'UNAUTHENTICATED');
@@ -105,7 +105,7 @@ await check('auth: invalid bearer → 401 + www-authenticate (exposed)', async (
   assert.ok(headers.get('access-control-expose-headers').split(',').includes('www-authenticate'));
 });
 await check('auth: invalid API key → 400 API_KEY_INVALID', async () => {
-  const { status, json } = await api('/drive/v3/files/img_senate_square', { key: 'WRONG' });
+  const { status, json } = await api('/drive/v3/files/img_city_square', { key: 'WRONG' });
   assert.equal(status, 400);
   assert.equal(json.error.details[0].reason, 'API_KEY_INVALID');
 });
@@ -149,18 +149,18 @@ await check('list: default fields = kind,incompleteSearch,nextPageToken,files(ki
 });
 await check('list: mimeType =, !=, contains; name contains (case-insensitive); and/or/not/()', async () => {
   const folders = await listAll({ q: `${qParents('folder_day3')} and mimeType = 'application/vnd.google-apps.folder'`, fields: 'nextPageToken,files(id)', ...KEY });
-  assert.deepEqual(ids(folders.files), ['folder_aurora']);
+  assert.deepEqual(ids(folders.files), ['folder_night_sky']);
   const nonFolders = await listAll({ q: `${qParents('folder_day3')} and mimeType != 'application/vnd.google-apps.folder'`, fields: 'nextPageToken,files(id)', ...KEY });
-  assert.deepEqual(ids(nonFolders.files), childrenOf('folder_day3').filter((i) => i !== 'folder_aurora'));
+  assert.deepEqual(ids(nonFolders.files), childrenOf('folder_day3').filter((i) => i !== 'folder_night_sky'));
   const vids = await listAll({ q: `${qParents('folder_day2')} and mimeType contains 'video/'`, fields: 'nextPageToken,files(id)', ...KEY });
-  assert.deepEqual(ids(vids.files), ['vid_hevc', 'vid_reindeer_mov']);
+  assert.deepEqual(ids(vids.files), ['vid_deer_mov', 'vid_hevc']);
   const named = await listAll({ q: `${qParents('folder_day1')} and name contains 'img_12'`, fields: 'nextPageToken,files(name)', ...KEY });
   assert.deepEqual(named.files.map((f) => f.name).sort(), ['IMG_1203.JPG', 'IMG_1207.JPG', 'IMG_1240.JPG', 'IMG_1250.JPG']);
   const media = await listAll({ q: `${qParents('folder_day1')} and trashed = false and (mimeType contains 'image/' or mimeType contains 'video/')`, fields: 'nextPageToken,files(id)', ...KEY });
   assert.equal(media.files.length, 7);
   const notImg = await listAll({ q: `${qParents('folder_day1')} and not mimeType contains 'image/'`, fields: 'nextPageToken,files(id)', ...KEY });
   assert.deepEqual(ids(notImg.files), ['vid_harbour_ferry', 'vid_tram']);
-  const multi = await listAll({ q: `('folder_day4' in parents or 'folder_aurora' in parents) and trashed = false`, fields: 'nextPageToken,files(id)', ...KEY });
+  const multi = await listAll({ q: `('folder_day4' in parents or 'folder_night_sky' in parents) and trashed = false`, fields: 'nextPageToken,files(id)', ...KEY });
   assert.equal(multi.files.length, 5);
   const esc = await api('/drive/v3/files', { q: `name contains 'Friend\\'s'`, fields: 'files(id)' }, { headers: BEARER });
   assert.deepEqual(ids(esc.json.files), ['folder_other']);
@@ -211,16 +211,16 @@ await check('list: folder_big paginates through 120 items', async () => {
 await check('fields: nested selection imageMediaMetadata(time,cameraModel)', async () => {
   const { files } = await listAll({ q: qParents('folder_day1'), fields: 'nextPageToken,files(id,name,mimeType,imageMediaMetadata(time,cameraModel))', ...KEY });
   const m = Object.fromEntries(files.map((f) => [f.id, f]));
-  assert.deepEqual(m.img_helsinki_cathedral.imageMediaMetadata, { time: '2025:07:12 12:20:00', cameraModel: 'iPhone 15' });
+  assert.deepEqual(m.img_cathedral.imageMediaMetadata, { time: '2025:07:12 12:20:00', cameraModel: 'iPhone 15' });
   assert.deepEqual(m.img_market_square_canon.imageMediaMetadata, { time: '2025:07:12 20:10:00', cameraModel: 'Canon EOS R6' });
-  assert.ok(!('imageMediaMetadata' in m.img_sauna), 'empty nested object must be omitted');
+  assert.ok(!('imageMediaMetadata' in m.img_cabin), 'empty nested object must be omitted');
   assert.ok(!('imageMediaMetadata' in m.vid_tram));
   const exifRange = (await api('/drive/v3/files/img_exif_range', { fields: 'id,imageMediaMetadata(time,width)', ...KEY })).json;
   assert.deepEqual(exifRange, { id: 'img_exif_range', imageMediaMetadata: { width: 1280 } });
 });
 await check('fields: slash syntax, location sub-fields, *, files(*)', async () => {
-  const s = await api('/drive/v3/files/img_suomenlinna_gps', { fields: 'id,imageMediaMetadata/location/latitude,imageMediaMetadata(location(longitude))', ...KEY });
-  assert.deepEqual(s.json, { id: 'img_suomenlinna_gps', imageMediaMetadata: { location: { latitude: 60.1454, longitude: 24.9881 } } });
+  const s = await api('/drive/v3/files/img_fortress_gps', { fields: 'id,imageMediaMetadata/location/latitude,imageMediaMetadata(location(longitude))', ...KEY });
+  assert.deepEqual(s.json, { id: 'img_fortress_gps', imageMediaMetadata: { location: { latitude: 37.9715, longitude: 23.7257 } } });
   const all = await api('/drive/v3/files/vid_tram', { fields: '*', ...KEY });
   const rec = byId.vid_tram;
   for (const k of ['kind', 'id', 'name', 'mimeType', 'parents', 'size', 'md5Checksum', 'createdTime', 'modifiedTime', 'videoMediaMetadata', 'thumbnailLink', 'hasThumbnail', 'webViewLink']) {
@@ -246,20 +246,20 @@ await check('fields: invalid selection → 400 invalidParameter', async () => {
 
 // ---------------------------------------------------------------- files.get
 await check('get: default fields kind,id,name,mimeType; HEAD works', async () => {
-  const { json } = await api('/drive/v3/files/img_senate_square', { supportsAllDrives: 'true', ...KEY });
-  assert.deepEqual(json, { kind: 'drive#file', id: 'img_senate_square', name: 'IMG_1203.JPG', mimeType: 'image/jpeg' });
-  const h = await api('/drive/v3/files/img_senate_square', KEY, { method: 'HEAD' });
+  const { json } = await api('/drive/v3/files/img_city_square', { supportsAllDrives: 'true', ...KEY });
+  assert.deepEqual(json, { kind: 'drive#file', id: 'img_city_square', name: 'IMG_1203.JPG', mimeType: 'image/jpeg' });
+  const h = await api('/drive/v3/files/img_city_square', KEY, { method: 'HEAD' });
   assert.equal(h.status, 200);
   assert.match(h.headers.get('content-type'), /application\/json/);
 });
 await check('get: shortcut details + target resolvable with API key', async () => {
   const { json } = await api('/drive/v3/files/sc_img_other', { fields: 'id,mimeType,shortcutDetails', ...KEY });
-  assert.deepEqual(json.shortcutDetails, { targetId: 'img_other_kauppatori', targetMimeType: 'image/jpeg' });
-  assert.equal((await api('/drive/v3/files/img_other_kauppatori', KEY)).status, 200);
+  assert.deepEqual(json.shortcutDetails, { targetId: 'img_other_market', targetMimeType: 'image/jpeg' });
+  assert.equal((await api('/drive/v3/files/img_other_market', KEY)).status, 200);
   const fsc = (await api('/drive/v3/files/sc_folder_extra', { fields: 'shortcutDetails', ...KEY })).json;
   assert.equal(fsc.shortcutDetails.targetMimeType, 'application/vnd.google-apps.folder');
   const extra = await listAll({ q: qParents('folder_extra'), fields: 'nextPageToken,files(id)', ...KEY });
-  assert.deepEqual(ids(extra.files), ['img_extra_porvoo']);
+  assert.deepEqual(ids(extra.files), ['img_extra_old_town']);
   // the friend's folder itself is private
   assert.equal((await api('/drive/v3/files', { q: qParents('folder_other'), ...KEY })).status, 404);
 });
@@ -304,7 +304,7 @@ await check('access: "root" alias needs OAuth', async () => {
 
 // ---------------------------------------------------------------- media
 await check('media: full download (200) with correct bytes and Content-Type', async () => {
-  for (const id of ['img_senate_square', 'vid_reindeer_mov', 'img_arctic_circle_heic', 'img_screenshot', 'txt_notes']) {
+  for (const id of ['img_city_square', 'vid_deer_mov', 'img_viewpoint_heic', 'img_screenshot', 'txt_notes']) {
     const r = await fetch(url(`/drive/v3/files/${id}`, { alt: 'media', supportsAllDrives: 'true', ...KEY }));
     const buf = Buffer.from(await r.arrayBuffer());
     assert.equal(r.status, 200, id);
@@ -386,7 +386,7 @@ await check('cors: every response header name is exposed', async () => {
 
 // ---------------------------------------------------------------- thumbnails
 await check('thumbs: thumbnailLink serves JPEG (s220 / w-h / unknown)', async () => {
-  const meta = (await api('/drive/v3/files/img_helsinki_cathedral', { fields: 'thumbnailLink,hasThumbnail', ...KEY })).json;
+  const meta = (await api('/drive/v3/files/img_cathedral', { fields: 'thumbnailLink,hasThumbnail', ...KEY })).json;
   assert.equal(meta.hasThumbnail, true);
   let r = await fetch(meta.thumbnailLink, { headers: { origin: ORIGIN } });
   let buf = Buffer.from(await r.arrayBuffer());
@@ -395,11 +395,11 @@ await check('thumbs: thumbnailLink serves JPEG (s220 / w-h / unknown)', async ()
   assert.equal(r.headers.get('access-control-allow-origin'), ORIGIN);
   assert.equal(buf.subarray(0, 3).toString('hex'), 'ffd8ff');
   const small = buf.length;
-  r = await fetch(`${driveUrl}/thumb/img_helsinki_cathedral=w800-h600`);
+  r = await fetch(`${driveUrl}/thumb/img_cathedral=w800-h600`);
   buf = Buffer.from(await r.arrayBuffer());
   assert.equal(r.status, 200);
   assert.ok(buf.length > small, 'large thumbnail expected');
-  for (const id of ['vid_hevc', 'img_arctic_circle_heic', 'img_screenshot']) {
+  for (const id of ['vid_hevc', 'img_viewpoint_heic', 'img_screenshot']) {
     r = await fetch(`${driveUrl}/thumb/${id}=s220`);
     await r.arrayBuffer();
     assert.equal(r.status, 200, id);
@@ -407,7 +407,7 @@ await check('thumbs: thumbnailLink serves JPEG (s220 / w-h / unknown)', async ()
   r = await fetch(`${driveUrl}/thumb/nope=s220`);
   await r.text();
   assert.equal(r.status, 404);
-  r = await fetch(`${driveUrl}/thumb/img_hidden_lapland=s220`);
+  r = await fetch(`${driveUrl}/thumb/img_hidden_berries=s220`);
   await r.text();
   assert.equal(r.status, 404, 'hidden items have no thumbnail yet');
 });
@@ -415,18 +415,18 @@ await check('thumbs: thumbnailLink serves JPEG (s220 / w-h / unknown)', async ()
 // ---------------------------------------------------------------- admin
 await check('admin: reveal / reveal-all / reset', async () => {
   const list = async () => ids((await listAll({ q: qParents('folder_day2', ' and trashed = false'), fields: 'nextPageToken,files(id)', ...KEY })).files);
-  assert.ok(!(await list()).includes('img_hidden_rovaniemi'));
-  assert.equal((await api('/drive/v3/files/img_hidden_rovaniemi', KEY)).status, 404);
-  assert.equal((await api('/drive/v3/files/img_hidden_rovaniemi', { alt: 'media' }, { headers: BEARER })).status, 404);
-  await admin.reveal('img_hidden_rovaniemi');
-  assert.ok((await list()).includes('img_hidden_rovaniemi'));
-  assert.equal((await api('/drive/v3/files/img_hidden_rovaniemi', { alt: 'media', ...KEY })).status, 200);
-  assert.equal((await api('/drive/v3/files/img_hidden_lapland', KEY)).status, 404);
+  assert.ok(!(await list()).includes('img_hidden_lunch'));
+  assert.equal((await api('/drive/v3/files/img_hidden_lunch', KEY)).status, 404);
+  assert.equal((await api('/drive/v3/files/img_hidden_lunch', { alt: 'media' }, { headers: BEARER })).status, 404);
+  await admin.reveal('img_hidden_lunch');
+  assert.ok((await list()).includes('img_hidden_lunch'));
+  assert.equal((await api('/drive/v3/files/img_hidden_lunch', { alt: 'media', ...KEY })).status, 200);
+  assert.equal((await api('/drive/v3/files/img_hidden_berries', KEY)).status, 404);
   const all = await admin.revealAll();
-  assert.deepEqual(all.ids, ['img_hidden_lapland']);
-  assert.equal((await api('/drive/v3/files/img_hidden_lapland', KEY)).status, 200);
+  assert.deepEqual(all.ids, ['img_hidden_berries']);
+  assert.equal((await api('/drive/v3/files/img_hidden_berries', KEY)).status, 200);
   await admin.reset();
-  assert.ok(!(await list()).includes('img_hidden_rovaniemi'));
+  assert.ok(!(await list()).includes('img_hidden_lunch'));
   const raw = await fetch(`${driveUrl}/__admin/reveal?id=nope`, { method: 'POST' });
   assert.equal(raw.status, 404);
   await raw.text();
@@ -450,12 +450,12 @@ await check('admin: latency', async () => {
   await admin.setLatency(0);
 });
 await check('admin: fail injection for media', async () => {
-  await admin.fail('img_senate_square', 500, 2);
-  const m = () => api('/drive/v3/files/img_senate_square', { alt: 'media', ...KEY });
+  await admin.fail('img_city_square', 500, 2);
+  const m = () => api('/drive/v3/files/img_city_square', { alt: 'media', ...KEY });
   const a = await m();
   assert.equal(a.status, 500);
   assert.equal(a.json.error.errors[0].reason, 'backendError');
-  assert.equal((await api('/drive/v3/files/img_senate_square', KEY)).status, 200, 'metadata unaffected');
+  assert.equal((await api('/drive/v3/files/img_city_square', KEY)).status, 200, 'metadata unaffected');
   assert.equal((await m()).status, 500);
   assert.equal((await m()).status, 200);
   await admin.fail('img_lake', 429, 1);

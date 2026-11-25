@@ -80,14 +80,54 @@ export function escapeQueryValue(v) {
   return String(v).replace(/\\/g, '\\\\').replace(/'/g, "\\'");
 }
 
-/** 画像・動画かどうか */
+/** MIME タイプの本体（"Image/JPEG; foo=bar" → "image/jpeg"）。パラメーターと前後の空白を除いて小文字にする */
+export function mimeEssence(mimeType) {
+  return String(mimeType || '').split(';')[0].trim().toLowerCase();
+}
+
+/**
+ * ブラウザが元ファイルを表示できる（またはこのアプリが変換できる）写真の形式。TIFF と JPEG XL は表示できる
+ * ブラウザ（Safari）があるので元ファイルから試す。これ以外の写真（カメラの RAW など）は、元ファイルを
+ * ダウンロードせずに Google ドライブのサムネイルを使う（prefersThumbnail）
+ */
+const BROWSER_IMAGE_TYPES = new Set([
+  'image/jpeg',
+  'image/jpg',
+  'image/pjpeg',
+  'image/png',
+  'image/x-png',
+  'image/apng',
+  'image/vnd.mozilla.apng',
+  'image/gif',
+  'image/webp',
+  'image/heic',
+  'image/heif',
+  'image/heic-sequence',
+  'image/heif-sequence',
+  'image/avif',
+  'image/bmp',
+  'image/x-bmp',
+  'image/x-ms-bmp',
+  'image/tiff',
+  'image/jxl',
+]);
+
+/** 写真として扱わない画像（アイコン） */
+const NON_PHOTO_IMAGE_TYPES = new Set(['image/x-icon', 'image/vnd.microsoft.icon', 'image/ico', 'image/icon']);
+
+/** 正しい形の MIME タイプの本体か（"type/subtype"。XML 系（+xml）と SVG は含めない: スクリプトを含められる） */
+function isPlainMediaEssence(t) {
+  return /^[a-z]+\/[a-z0-9][a-z0-9.+-]*$/.test(t) && !t.endsWith('+xml') && !t.includes('svg');
+}
+
+/**
+ * 画像・動画かどうか。画像は SVG・XML 系とアイコン以外のすべて（ブラウザが表示できない TIFF や RAW は
+ * サムネイルで表示する）。ダウンロードしたファイルの Content-Type は safeMediaType で付け直す
+ */
 export function mediaKind(mimeType, name = '') {
-  const mt = (mimeType || '').toLowerCase();
-  if (mt.startsWith('image/')) {
-    if (mt === 'image/svg+xml' || mt === 'image/x-icon' || mt === 'image/vnd.microsoft.icon') return null;
-    return 'image';
-  }
-  if (mt.startsWith('video/')) return 'video';
+  const mt = mimeEssence(mimeType);
+  if (mt.startsWith('image/')) return isPlainMediaEssence(mt) && !NON_PHOTO_IMAGE_TYPES.has(mt) ? 'image' : null;
+  if (mt.startsWith('video/')) return isPlainMediaEssence(mt) ? 'video' : null;
   // Drive が application/octet-stream と判定した場合の拡張子による救済
   if (mt === 'application/octet-stream' || !mt) {
     const ext = (name.match(/\.([^.]+)$/) || [])[1]?.toLowerCase();
@@ -97,9 +137,28 @@ export function mediaKind(mimeType, name = '') {
   return null;
 }
 
+/** 元ファイルをブラウザで表示できる見込みがない写真（カメラの RAW など）か。元ファイルより先にサムネイルを使う */
+export function prefersThumbnail(mimeType) {
+  const mt = mimeEssence(mimeType);
+  return mt.startsWith('image/') && !BROWSER_IMAGE_TYPES.has(mt);
+}
+
+/**
+ * ダウンロードしたファイル（Blob）に付ける Content-Type。sw.js の mediaType() と同じ規則:
+ * 本体だけ（パラメーターは捨てる）、画像・動画・音声のみ、SVG や XML 系は不可。
+ * 応答の Content-Type が使えなければ hint（Drive の mimeType）、それも使えなければ application/octet-stream
+ */
+export function safeMediaType(contentType, hint = '') {
+  for (const v of [contentType, hint]) {
+    const t = mimeEssence(v);
+    if (/^(image|video|audio)\//.test(t) && isPlainMediaEssence(t)) return t;
+  }
+  return 'application/octet-stream';
+}
+
 /** 拡張子などから MIME タイプを補正（Drive が octet-stream を返す場合など） */
 export function normalizeMimeType(mimeType, name = '') {
-  const mt = (mimeType || '').toLowerCase();
+  const mt = mimeEssence(mimeType);
   if (mt && mt !== 'application/octet-stream') return mt;
   const ext = (name.match(/\.([^.]+)$/) || [])[1]?.toLowerCase();
   const map = {
@@ -213,7 +272,8 @@ export class DriveClient {
       const { headers: h, token } = await this._headers(ids, headers);
       let res;
       try {
-        res = await fetch(url, { method, headers: h, signal, credentials: 'omit', mode: 'cors' });
+        // no-store: 写真の元ファイルなどをブラウザの HTTP キャッシュに残さない（ログアウト後に読み出せないように）
+        res = await fetch(url, { method, headers: h, signal, credentials: 'omit', mode: 'cors', cache: 'no-store' });
       } catch (e) {
         if (signal?.aborted) throw e;
         if (attempt < Math.min(3, retries)) {

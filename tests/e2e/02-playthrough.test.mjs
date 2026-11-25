@@ -2,7 +2,7 @@
 // HEVC fallback, max video duration) and scenario 10 (Service Worker blocked: direct URL / blob paths).
 import { test, before, after } from 'node:test';
 import {
-  openSuite, assert, assertOrder, expectedFor, mediaRequests, assertNoPageErrors, colorNear, dedupeSlides, startStrippingProxy, jaDateTime, TEST_KEY,
+  openSuite, assert, assertOrder, expectedFor, mediaRequests, assertNoPageErrors, assertNoCspViolations, colorNear, dedupeSlides, startStrippingProxy, jaDateTime, TEST_KEY,
 } from './lib.mjs';
 
 let suite;
@@ -14,7 +14,7 @@ after(async () => {
 });
 
 const ROOT_PARAMS = { folder: 'folder_root', key: TEST_KEY, mode: 'apikey', interval: 1, autostart: 1 };
-const PLAYABLE_VIDEOS = ['vid_harbour_ferry', 'vid_tram', 'vid_reindeer_mov', 'vid_pxl_husky', 'vid_long_walk'];
+const PLAYABLE_VIDEOS = ['vid_harbour_ferry', 'vid_tram', 'vid_deer_mov', 'vid_pxl_bike', 'vid_long_walk'];
 const slideKey = (e) => (e.kind === 'title' ? 'title' : e.kind === 'day' ? `day:${e.day}` : `${e.kind === 'end' ? 'end' : 'media'}:${e.id || e.kind}`);
 
 test('2. full playthrough (interval=1, video max 2 s): every item shown in order, videos stream through the SW with Range, HEVC → Drive embed, loops to the title', { timeout: 240000 }, (t) => suite.wrap('02-playthrough', async () => {
@@ -43,7 +43,7 @@ test('2. full playthrough (interval=1, video max 2 s): every item shown in order
     const want = jaDateTime(suite.byId[e.id]._test.expected.appTimeUtcDefault);
     assert.ok(e.caption.includes(want), `${e.id}: caption 「${e.caption}」 should contain 「${want}」`);
     assert.ok(e.caption.includes(`${dayNo[e.id]}日目`), `${e.id}: caption 「${e.caption}」 day ${dayNo[e.id]}`);
-    assert.equal(e.caption.includes('日時推定'), e.id === 'img_sauna', `${e.id}: 日時推定 badge`);
+    assert.equal(e.caption.includes('日時推定'), e.id === 'img_cabin', `${e.id}: 日時推定 badge`);
   }
 
   // photos: the right picture is on screen (corner colour = fixture background colour)
@@ -55,7 +55,7 @@ test('2. full playthrough (interval=1, video max 2 s): every item shown in order
       sampled++;
       assert.ok(colorNear(e.color, suite.byId[e.id]._test.bgColor), `${e.id}: corner colour ${e.color} vs ${suite.byId[e.id]._test.bgColor}`);
     }
-    if (e.id !== 'img_arctic_circle_heic') assert.match(e.src, /^blob:/, `${e.id}: original image (blob via SW), got ${e.src}`);
+    if (e.id !== 'img_viewpoint_heic') assert.match(e.src, /^blob:/, `${e.id}: original image (blob via SW), got ${e.src}`);
   }
   assert.ok(sampled >= photos.length - 2, `colour sampled for ${sampled}/${photos.length} photos`);
 
@@ -97,6 +97,7 @@ test('2. full playthrough (interval=1, video max 2 s): every item shown in order
   const counter = await app.page.evaluate(() => document.querySelector('#player .counter').textContent);
   assert.match(counter, new RegExp(`^(\\d+ / ${expected.length})?$`));
   assertNoPageErrors(app);
+  await assertNoCspViolations(app);
   await app.close();
 })(t));
 
@@ -104,14 +105,14 @@ test('2b. Service Worker proxy contract: Range, QuickTime → video/mp4, suffix 
   await suite.admin.reset();
   const app = await suite.newApp({ params: ROOT_PARAMS });
   await app.waitForPlayer();
-  const sizes = Object.fromEntries(['vid_reindeer_mov', 'vid_tram', 'img_reskey_1'].map((id) => [id, Number(suite.byId[id].size)]));
+  const sizes = Object.fromEntries(['vid_deer_mov', 'vid_tram', 'img_reskey_1'].map((id) => [id, Number(suite.byId[id].size)]));
   const r = await app.page.evaluate(async (sizes) => {
     const get = async (path, range) => {
       const res = await fetch(path, { headers: range ? { Range: range } : {} });
       const body = await res.arrayBuffer();
       return { status: res.status, ct: res.headers.get('content-type'), cr: res.headers.get('content-range'), len: body.byteLength, ar: res.headers.get('accept-ranges') };
     };
-    const mov = `__drive/media/vid_reindeer_mov?mt=video%2Fquicktime&sz=${sizes.vid_reindeer_mov}`;
+    const mov = `__drive/media/vid_deer_mov?mt=video%2Fquicktime&sz=${sizes.vid_deer_mov}`;
     return {
       head: await get(mov, 'bytes=0-99'),
       suffix: await get(mov, 'bytes=-100'),
@@ -123,7 +124,7 @@ test('2b. Service Worker proxy contract: Range, QuickTime → video/mp4, suffix 
       controlled: !!navigator.serviceWorker.controller,
     };
   }, sizes);
-  const M = sizes.vid_reindeer_mov;
+  const M = sizes.vid_deer_mov;
   assert.equal(r.controlled, true);
   assert.deepEqual(r.head, { status: 206, ct: 'video/mp4', cr: `bytes 0-99/${M}`, len: 100, ar: 'bytes' }, 'QuickTime served as video/mp4');
   assert.deepEqual(r.suffix, { status: 206, ct: 'video/mp4', cr: `bytes ${M - 100}-${M - 1}/${M}`, len: 100, ar: 'bytes' });
@@ -163,6 +164,7 @@ test('2c. Content-Range hidden by CORS (no Access-Control-Expose-Headers): the S
     assert.equal((await app.videoInfo()).vid_tram.videoWidth, 640);
     assert.ok(proxy.stats.requests > 0);
     assertNoPageErrors(app);
+    await assertNoCspViolations(app);
     await app.close();
   } finally {
     await proxy.close();
@@ -184,7 +186,7 @@ test('10. Service Workers blocked by the browser (newContext serviceWorkers:"blo
     assert.fail(`slideshow never started with Service Workers blocked: stuck on screen=${st.screen} 「${st.loading}」 `
       + '(setupServiceWorker() must give up on register()/ready after its timeout and return null)');
   }
-  await app.waitForSlide({ id: 'img_senate_square' }, 20000);
+  await app.waitForSlide({ id: 'img_city_square' }, 20000);
   await app.jumpViaGrid('vid_tram');
   await app.page.waitForFunction(() => window.__video.vid_tram && window.__video.vid_tram.maxTime > 0.3, null, { timeout: 15000 });
   await app.waitForSlide({ id: 'img_market_square_canon' }, 15000);
@@ -199,7 +201,7 @@ test('10a. no Service Worker API, API-key mode: photos via fetch→blob, videos 
   await app.goto();
   await app.waitForPlayer();
   assert.equal(await app.page.evaluate(() => window.__slideshow.sw), null, 'no Service Worker');
-  await app.waitForSlide({ id: 'img_senate_square' }, 20000);
+  await app.waitForSlide({ id: 'img_city_square' }, 20000);
   await app.jumpViaGrid('vid_tram');
   await app.page.waitForFunction(() => window.__video.vid_tram && window.__video.vid_tram.maxTime > 0.3, null, { timeout: 15000 });
   const v = (await app.videoInfo()).vid_tram;
@@ -219,6 +221,7 @@ test('10a. no Service Worker API, API-key mode: photos via fetch→blob, videos 
   const reqs = mediaRequests(await suite.admin.log(), 'img_market_square_canon');
   assert.ok(reqs.some((e) => !e.range && e.auth === 'key' && e.status === 200), 'full download with key');
   assertNoPageErrors(app);
+  await assertNoCspViolations(app);
   await app.close();
 })(t));
 
@@ -236,8 +239,9 @@ test('10b. no Service Worker API, OAuth mode: videos are downloaded as blobs and
   const reqs = mediaRequests(await suite.admin.log(), 'vid_harbour_ferry');
   assert.ok(reqs.some((e) => !e.range && e.auth === 'bearer' && e.authOk && e.status === 200), 'full download with the bearer token');
   // next photo also loads without the SW (fetch with Authorization → blob)
-  await app.waitForSlide({ id: 'img_suomenlinna_gps' }, 15000);
-  await app.page.waitForFunction(() => window.__slideLog.find((e) => e.id === 'img_suomenlinna_gps')?.nw > 0);
+  await app.waitForSlide({ id: 'img_fortress_gps' }, 15000);
+  await app.page.waitForFunction(() => window.__slideLog.find((e) => e.id === 'img_fortress_gps')?.nw > 0);
   assertNoPageErrors(app);
+  await assertNoCspViolations(app);
   await app.close();
 })(t));

@@ -207,12 +207,16 @@ test('sw: navigations and non-media destinations are not proxied', async () => {
   }
 });
 
-test('sw: only image/video/audio content types pass (no SVG/HTML); nosniff + CSP sandbox on every response', async () => {
+test('sw: only image/video/audio content types pass (no SVG / +xml / HTML); nosniff + CSP sandbox on every response', async () => {
   const types = {
     html: 'text/html; charset=utf-8',
     svg: 'image/svg+xml',
     svg2: 'Image/SVG+XML; charset=utf-8',
     xml: 'application/xhtml+xml',
+    xml2: 'image/x-test+xml; charset=utf-8',
+    xml3: 'video/x-test+xml',
+    svg3: 'image/svg',
+    tiff: 'image/tiff',
     mov: 'video/quicktime',
     jpg: 'image/jpeg',
     heic: 'image/heic',
@@ -238,6 +242,12 @@ test('sw: only image/video/audio content types pass (no SVG/HTML); nosniff + CSP
   assert.equal(await ct('__drive/media/svg'), 'application/octet-stream');
   assert.equal(await ct('__drive/media/svg2?mt=image%2Fsvg%2Bxml'), 'application/octet-stream');
   assert.equal(await ct('__drive/media/xml'), 'application/octet-stream');
+  // any XML-based type (+xml) is refused, not only SVG
+  assert.equal(await ct('__drive/media/xml2'), 'application/octet-stream');
+  assert.equal(await ct('__drive/media/xml3?mt=image%2Fx-test%2Bxml'), 'application/octet-stream');
+  // a non-standard SVG label is refused too; other raster types (TIFF, RAW) keep their type
+  assert.equal(await ct('__drive/media/svg3'), 'application/octet-stream');
+  assert.equal(await ct('__drive/media/tiff'), 'image/tiff');
   assert.equal(await ct('__drive/media/mov'), 'video/mp4');
   assert.equal(await ct('__drive/media/jpg'), 'image/jpeg');
   assert.equal(await ct('__drive/media/heic'), 'image/heic');

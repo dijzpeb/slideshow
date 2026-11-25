@@ -24,7 +24,8 @@ import {
 import { parseFolderInput, mediaKind, normalizeMimeType, escapeQueryValue } from '../../js/drive.js';
 import { sanitize, settingsFromUrl, loadSettings, buildShareUrl, resolveApiBase, DEFAULTS, offsetsForFolder, legacyOffsetsForFolder } from '../../js/settings.js';
 
-const TZ = 'Europe/Helsinki';
+// 撮影地: UTC+2、夏時間は UTC+3
+const TZ = 'Europe/Athens';
 const iso = (t) => new Date(t).toISOString();
 
 const files = [
@@ -32,7 +33,7 @@ const files = [
   { id: 'b', name: 'canon.jpg', mimeType: 'image/jpeg', imageMediaMetadata: { time: '2025:07:12 19:30:00', cameraMake: 'Canon', cameraModel: 'Canon EOS R6' }, modifiedTime: '2025-08-01T00:00:00Z', createdTime: '2025-08-01T00:00:00Z' },
   { id: 'c', name: 'VID_20250712_160000.mp4', mimeType: 'video/mp4', videoMediaMetadata: { durationMillis: '3000', width: 640, height: 360 }, modifiedTime: '2025-08-01T00:00:00Z', createdTime: '2025-08-01T00:00:00Z' },
   { id: 'd', name: 'PXL_20250713_063000123.mp4', mimeType: 'video/mp4', modifiedTime: '2025-08-01T00:00:00Z', createdTime: '2025-08-01T00:00:00Z' },
-  { id: 'e', name: 'sauna.jpg', mimeType: 'image/jpeg', modifiedTime: '2025-07-13T17:00:00Z', createdTime: '2025-08-02T00:00:00Z' },
+  { id: 'e', name: 'cabin.jpg', mimeType: 'image/jpeg', modifiedTime: '2025-07-13T17:00:00Z', createdTime: '2025-08-02T00:00:00Z' },
   { id: 'f', name: 'noexif.jpg', mimeType: 'image/jpeg', modifiedTime: '2025-08-01T00:00:00Z', createdTime: '2025-08-01T00:00:00Z' },
   { id: 'g', name: 'doc', mimeType: 'application/vnd.google-apps.document' },
 ];
@@ -99,7 +100,7 @@ test('buildCatalog sorts chronologically, ignores non-media, applies camera offs
   assert.equal(items.find((i) => i.id === 'b').group, 'Canon EOS R6');
   assert.equal(items.find((i) => i.id === 'a').group, 'Apple iPhone 15');
   const fixed = buildCatalog(files, extracted, { timeZone: TZ, cameraOffsets: { 'Canon EOS R6': -360 } });
-  // Canon: 19:30 → 13:30 Helsinki = 10:30Z、iPhone 11:00Z より前
+  // Canon: 19:30 → 現地 13:30（UTC+3）= 10:30Z、iPhone 11:00Z より前
   assert.deepEqual(fixed.map((i) => i.id), ['b', 'a', 'c', 'd', 'f', 'e']);
   assert.equal(fixed[0].offsetMinutes, -360);
   assert.equal(fixed[0].day, '2025-07-12');
@@ -157,7 +158,7 @@ test('correctionGroup: times with an explicit UTC offset get their own group', (
 });
 
 test('buildCatalog: a correction for the local-clock group does not apply after the EXIF offset is read (F0)', () => {
-  // Sony の時計が日本時間のまま: Drive の時刻 19:05（ヘルシンキとして読むと 16:05Z、6 時間遅い）
+  // Sony の時計が日本時間のまま: Drive の時刻 19:05（撮影地の時刻として読むと 16:05Z、6 時間遅い）
   const sony = { id: 's', name: 'DSC01234.JPG', mimeType: 'image/jpeg', imageMediaMetadata: { time: '2025:07:13 19:05:00', cameraMake: 'SONY', cameraModel: 'ILCE-7M4' } };
   const cameraOffsets = { 'SONY ILCE-7M4': -360 };
   const before = buildCatalog([sony], null, { timeZone: TZ, cameraOffsets });
@@ -222,7 +223,7 @@ test('cameraGroup: videos without a camera label are grouped by file name (F2)',
 });
 
 test('correctionGroup: a labelled video timed by mvhd gets its own （動画） group, corrected apart from the photos (F2)', () => {
-  // Canon の時計は正しい（ヘルシンキ）。写真は現地時刻、動画の mvhd にも現地時刻（UTC として読むと 3 時間遅い）
+  // Canon の時計は正しい（撮影地の時刻）。写真は現地時刻、動画の mvhd にも現地時刻（UTC として読むと 3 時間遅い）
   const fs = [
     { id: 'photo', name: 'IMG_0001.JPG', mimeType: 'image/jpeg', imageMediaMetadata: { time: '2025:07:13 15:00:00', cameraMake: 'Canon', cameraModel: 'Canon EOS R6' } },
     { id: 'video', name: 'MVI_0002.MP4', mimeType: 'video/mp4' },
@@ -355,6 +356,9 @@ test('settings: sanitize, URL params, share URL', () => {
   assert.equal(share.searchParams.get('folder'), 'F');
   assert.equal(share.searchParams.get('key'), 'K');
   assert.equal(share.searchParams.get('old'), null);
+  // 既定のタイムゾーン（この端末のもの）でも必ず付ける。開く人の端末のタイムゾーンは違うかもしれない
+  assert.equal(share.searchParams.get('tz'), DEFAULTS.timeZone);
+  assert.equal(new URL(buildShareUrl('https://x.github.io/slideshow/', { ...DEFAULTS, folder: 'F', timeZone: 'Asia/Tokyo' })).searchParams.get('tz'), 'Asia/Tokyo');
 });
 
 test('resolveApiBase only allows overrides on localhost', () => {

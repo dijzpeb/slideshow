@@ -31,7 +31,17 @@ export function isValidTimeZone(timeZone) {
   }
 }
 
-/** 指定時刻（epoch ms）における timeZone の UTC オフセット（ms）。例: Helsinki 夏時間 → +3h */
+/** この端末のタイムゾーン（IANA 名）。取得できないか正しくなければ 'UTC' */
+export function deviceTimeZone() {
+  try {
+    const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    return isValidTimeZone(tz) ? tz : 'UTC';
+  } catch {
+    return 'UTC';
+  }
+}
+
+/** 指定時刻（epoch ms）における timeZone の UTC オフセット（ms）。例: Europe/Paris の夏時間 → +2h */
 export function tzOffsetMs(epochMs, timeZone) {
   const parts = getDtf(timeZone).formatToParts(new Date(epochMs));
   const v = {};

@@ -1,7 +1,7 @@
 // Extra: private files whose thumbnailLink is not usable from <img> (thumbnails need auth, as for
 // real private Drive files without cookies): the show is unaffected, the grid degrades gracefully.
 import { test, before, after } from 'node:test';
-import { openSuite, assert, assertOrder, expectedFor, assertNoPageErrors } from './lib.mjs';
+import { openSuite, assert, assertOrder, expectedFor, assertNoPageErrors, assertNoCspViolations } from './lib.mjs';
 
 let suite;
 before(async () => {
@@ -46,5 +46,6 @@ test('20. OAuth with thumbnails that need auth: photos/videos still play, grid s
   await page.waitForTimeout(1000);
   assert.equal((await suite.admin.log()).filter((e) => e.path.startsWith('/thumb/')).length, 0, 'thumbnails not requested again');
   assertNoPageErrors(app);
+  await assertNoCspViolations(app);
   await app.close();
 })(t));

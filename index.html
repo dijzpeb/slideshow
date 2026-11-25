@@ -2,6 +2,12 @@
 <html lang="ja">
   <head>
     <meta charset="utf-8" />
+    <!--
+      Content-Security-Policy（GitHub Pages ではヘッダーを付けられないので meta で指定。読み込みより前に置くこと）。
+      Google のログイン（GIS）・Drive API・サムネイル・ドライブの埋め込みプレーヤー以外の外部には接続しない。
+      テスト・開発用のサーバー（tests/e2e/harness.mjs、scripts/serve.mjs）は、ここにローカルのモックの接続先を足して配信する。
+    -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' https://accounts.google.com/gsi/client; connect-src 'self' https://www.googleapis.com https://accounts.google.com/gsi/ https://oauth2.googleapis.com; img-src 'self' blob: data: https://*.googleusercontent.com https://drive.google.com; media-src 'self' blob: https://www.googleapis.com; style-src 'self' https://accounts.google.com/gsi/style; frame-src https://drive.google.com https://accounts.google.com/gsi/; worker-src 'self' blob:; manifest-src 'self'; base-uri 'none'; form-action 'none'; object-src 'none'" />
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
     <meta name="color-scheme" content="dark light" />
     <meta name="theme-color" content="#0b1020" />
@@ -44,6 +50,11 @@
 
         <section class="field-group">
           <h2>2. ドライブへの接続方法</h2>
+          <div id="link-auth-warning" class="warn-box" role="alert" hidden>
+            <p><strong>リンクで指定された接続設定です。信頼できるリンクでなければ使わないでください。</strong></p>
+            <p class="hint">このリンクには、このブラウザに保存済みのものとは違う OAuth クライアント ID または API キーが含まれています。このまま「スライドショーを開始」を押すと、リンクの接続設定を使って保存します。</p>
+            <button id="btn-link-auth-revert" type="button" class="btn btn-secondary btn-sm">保存済みの接続設定に戻す</button>
+          </div>
           <div class="radio-cards" role="radiogroup" aria-label="接続方法">
             <label class="radio-card">
               <input type="radio" name="authMode" value="oauth" />
@@ -71,7 +82,8 @@
           </div>
 
           <div class="mode-panel" data-mode="apikey">
-            <label class="field">
+            <p id="apikey-locked" class="hint" hidden>このページに設定済みの API キーを使います。</p>
+            <label id="apikey-field" class="field">
               <span class="label">API キー</span>
               <input id="f-apiKey" name="apiKey" type="text" spellcheck="false" placeholder="AIza..." />
               <span class="hint">Google Drive API を有効にしたプロジェクトの API キー。ウェブサイト制限（HTTP リファラー）の設定をおすすめします。</span>
@@ -110,7 +122,7 @@
                 <span class="label">撮影地のタイムゾーン</span>
                 <input name="timeZone" type="text" list="tz-list" spellcheck="false" />
                 <datalist id="tz-list"></datalist>
-                <span class="hint">写真の撮影時刻はこのタイムゾーンの現地時刻として扱います（フィンランドは Europe/Helsinki）。</span>
+                <span class="hint">写真の撮影時刻はこのタイムゾーンの現地時刻として扱います（初期値はこの端末のタイムゾーン。例：Asia/Tokyo、Europe/Paris、America/New_York）。</span>
               </label>
               <label class="field">
                 <span class="label">フォルダの自動更新（分、0 = しない）</span>
@@ -126,7 +138,7 @@
               </label>
               <label class="field">
                 <span class="label">タイトル（空欄ならフォルダ名）</span>
-                <input name="title" type="text" maxlength="120" placeholder="フィンランド旅行 2025" />
+                <input name="title" type="text" maxlength="120" placeholder="家族旅行 2025" />
               </label>
             </div>
             <div class="checks">
@@ -153,11 +165,13 @@
       <details class="help card-panel">
         <summary>はじめての方へ：準備の手順</summary>
         <ol>
-          <li>Google ドライブに旅行用のフォルダを作り、写真・動画を入れます（日ごとのサブフォルダに分けても OK）。</li>
-          <li><strong>Google アカウントでログイン</strong>する場合：Google Cloud コンソールで「Google Drive API」を有効にし、OAuth クライアント ID（ウェブアプリケーション、承認済みの JavaScript 生成元にこのページのアドレス）を作成して上の欄に入力します。</li>
-          <li><strong>API キー</strong>を使う場合：フォルダを「リンクを知っている全員（閲覧者）」で共有し、Google Drive API を有効にしたプロジェクトで API キーを作成して入力します。</li>
+          <li>Google ドライブにフォルダを作り、写真・動画を入れます（日ごとのサブフォルダに分けても OK）。</li>
+          <li data-help="setup"><strong>Google アカウントでログイン</strong>する場合：Google Cloud コンソールで「Google Drive API」を有効にし、OAuth 同意画面を設定します（対象を「外部」にした場合は、見る人の Google アカウントをテストユーザーに追加します）。次に OAuth クライアント ID（種類はウェブ アプリケーション。承認済みの JavaScript 生成元には、このページのオリジン（例: https://&lt;ユーザー名&gt;.github.io。パスは付けません））を作成し、「OAuth クライアント ID」欄に入力します。</li>
+          <li data-help="setup"><strong>API キー</strong>を使う場合：フォルダを「リンクを知っている全員（閲覧者）」で共有し、Google Drive API を有効にしたプロジェクトで API キーを作成して入力します。</li>
+          <li id="help-locked" hidden>接続方法はこのページに設定済みです（Google Cloud の準備は不要です）。ログインする場合は、フォルダがその Google アカウントに共有されている必要があります。</li>
           <li>フォルダの URL を貼り付けて「スライドショーを開始」を押します。</li>
         </ol>
+        <p>詳しい手順は README を参照してください。</p>
         <p>写真は撮影日時（EXIF）、動画は動画ファイル内の撮影日時で並べます。見つからない場合はファイル名やドライブ上の日時から推定します。</p>
         <p>キーボード操作：<kbd>Space</kbd> 再生/一時停止、<kbd>←</kbd><kbd>→</kbd> 前/次、<kbd>F</kbd> 全画面、<kbd>M</kbd> ミュート、<kbd>G</kbd> 一覧</p>
       </details>
@@ -191,7 +205,7 @@
       </div>
       <details id="time-fix" class="time-fix">
         <summary>撮影時刻がずれている？ カメラごとに補正する</summary>
-        <p class="hint">カメラの時計を日本時間のままにしていた場合などは、そのカメラの写真だけ時刻をずらして正しい順番にできます（例：日本時間のままのカメラをフィンランド夏時間に合わせるには −6 時間）。</p>
+        <p class="hint">カメラの時計を日本時間のままにしていた場合などは、そのカメラの写真だけ時刻をずらして正しい順番にできます（例：日本時間のままのカメラを、日本より 7 時間遅い撮影地の時刻に合わせるには −7 時間）。</p>
         <div id="time-fix-table"></div>
         <div class="actions"><button id="btn-time-fix-apply" type="button" class="btn btn-primary btn-sm">補正を適用</button></div>
       </details>
@@ -206,7 +220,7 @@
           <button id="btn-folder-close" type="button" class="ctl" aria-label="閉じる">×</button>
         </div>
         <form id="folder-search-form" class="input-row">
-          <input id="folder-query" type="search" placeholder="フォルダ名（例：フィンランド）" />
+          <input id="folder-query" type="search" placeholder="フォルダ名（例：旅行）" />
           <button type="submit" class="btn btn-secondary">検索</button>
         </form>
         <ul id="folder-results" class="folder-results"></ul>

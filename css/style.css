@@ -343,6 +343,22 @@ input::placeholder {
   white-space: pre-wrap;
 }
 
+.warn-box {
+  margin: 0 0 12px;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid rgba(253, 224, 71, 0.55);
+  background: rgba(113, 63, 18, 0.4);
+  color: #fef08a;
+  line-height: 1.6;
+}
+.warn-box p {
+  margin: 0 0 8px;
+}
+.warn-box .hint {
+  color: #fde68a;
+}
+
 .actions {
   display: flex;
   flex-wrap: wrap;
@@ -358,6 +374,7 @@ input::placeholder {
 .help ol {
   padding-left: 1.3em;
   line-height: 1.7;
+  overflow-wrap: anywhere;
 }
 .help p {
   line-height: 1.7;

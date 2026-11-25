@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 // 開発用の簡易静的ファイルサーバー（依存パッケージなし）。
 // 使い方: node scripts/serve.mjs [--port 8080] [--host 127.0.0.1] [--root .]
+// ページを ?apiBase=http://127.0.0.1:<port>（Drive API のモック）で開いたときは、index.html の CSP にその接続先を足して配信する。
 import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { addLocalOriginsToCsp, apiBaseOrigin } from './dev-csp.mjs';
 
 const args = process.argv.slice(2);
 function opt(name, def) {
@@ -54,15 +56,21 @@ const server = http.createServer((req, res) => {
         res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' }).end('Not Found');
         return;
       }
+      const ext = path.extname(file).toLowerCase();
+      const mock = ext === '.html' ? apiBaseOrigin(req.url) : null;
+      const body = mock ? Buffer.from(addLocalOriginsToCsp(data.toString('utf8'), [mock])) : data;
       res.writeHead(200, {
-        'Content-Type': TYPES[path.extname(file).toLowerCase()] || 'application/octet-stream',
+        'Content-Type': TYPES[ext] || 'application/octet-stream',
         'Cache-Control': 'no-store',
       });
-      res.end(req.method === 'HEAD' ? undefined : data);
+      res.end(req.method === 'HEAD' ? undefined : body);
     });
   });
 });
 
 server.listen(port, host, () => {
-  console.log(`Serving ${root} at http://${host}:${port}/`);
+  // Google の「承認済みの JavaScript 生成元」や API キーのウェブサイト制限には localhost で登録するので
+  // （127.0.0.1 は別のオリジン）、ループバックで待ち受けるときは localhost の URL を表示する
+  const shown = ['127.0.0.1', '::1', 'localhost'].includes(host) ? 'localhost' : host;
+  console.log(`Serving ${root} at http://${shown}:${server.address().port}/`);
 });

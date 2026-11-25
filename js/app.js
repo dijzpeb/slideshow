@@ -12,10 +12,15 @@ import {
   withFolderOffsets,
   legacyOffsetsForFolder,
   withoutLegacyOffsets,
+  authLock,
+  applyAuthLock,
+  linkAuthConflict,
+  updateStoredSettings,
+  withFolderOffsetsFrom,
 } from './settings.js';
 import { OAuthSession, AuthError, EXPIRY_WARNING_MS } from './auth.js';
 import { DriveClient, DriveError, AuthRequiredError, parseFolderInput } from './drive.js';
-import { extractAll, readCached } from './extract.js';
+import { extractAll, readCached, clearMetaCache, hasMetaCache } from './extract.js';
 import {
   buildCatalog,
   summarizeGroups,
@@ -32,6 +37,14 @@ import { formatDateJa, formatTimeJa, formatDateTimeJa, isValidTimeZone, tzOffset
 const params = new URLSearchParams(location.search);
 const apiBase = resolveApiBase(location);
 const deployConfig = window.SLIDESHOW_CONFIG || {};
+/** config.js で固定された接続設定（OAuth クライアント ID / API キー）。URL・保存済みの値・フォームより優先 */
+const lock = authLock(deployConfig);
+/** 固定されていない配布で、リンクの接続設定が保存済みの値と違う（黙って使わず、確かめてもらう） */
+const linkConflict = linkAuthConflict(deployConfig, location.search);
+/** 保存済みの設定の一部だけを書き換える（リンクで渡されただけの値は保存しない） */
+const storeOnly = (patch) => updateStoredSettings(patch, { fallbackFolder: deployConfig.folder || '' });
+/** 再生中にプレイヤーが変える設定（これだけを保存する） */
+const PLAYER_SETTINGS = ['videoMuted'];
 
 const state = {
   settings: loadSettings(deployConfig, location.search),
@@ -101,14 +114,63 @@ function readForm() {
   for (const name of ['kenBurns', 'blurBackground', 'showTitleCard', 'showDayCards', 'videoMuted', 'loop', 'includeSubfolders', 'preciseTimes']) {
     s[name] = form[name].checked;
   }
-  return s;
+  // config.js で固定された接続設定は、フォームの値（書き換えられていても）より優先する
+  return applyAuthLock(s, lock);
 }
+
+/** フォームの接続設定（固定された値を当てはめたもの） */
+function formAuth() {
+  const mode = ($('input[name="authMode"]:checked', form) || {}).value || 'oauth';
+  return applyAuthLock({ authMode: mode, clientId: form.clientId.value.trim(), apiKey: form.apiKey.value.trim() }, lock);
+}
+
+/** config.js で固定された接続設定: 使えない接続方法と、固定された入力欄を隠す */
+function applyLockToForm() {
+  if (!lock.any) return;
+  for (const radio of $$('input[name="authMode"]', form)) {
+    const usable = !lock.authMode || radio.value === lock.authMode;
+    radio.disabled = !usable;
+    radio.closest('.radio-card').hidden = !usable;
+  }
+  if (lock.clientId || lock.authMode === 'apikey') {
+    $('#oauth-advanced').hidden = true;
+    form.clientId.readOnly = true;
+  }
+  if (lock.apiKey || lock.authMode === 'oauth') {
+    $('#apikey-field').hidden = true;
+    form.apiKey.readOnly = true;
+  }
+  $('#apikey-locked').hidden = !lock.apiKey;
+  // 「はじめての方へ」: クライアント ID / API キーを作る手順は不要（入力欄もない）
+  for (const li of $$('[data-help="setup"]')) li.hidden = true;
+  $('#help-locked').hidden = false;
+}
+
+/** リンクの接続設定が保存済みの値と違うときの警告（「保存済みの設定に戻す」で元に戻せる） */
+function showLinkAuthWarning() {
+  const box = $('#link-auth-warning');
+  box.hidden = false;
+  if (linkConflict.clientId) $('#oauth-advanced').open = true;
+  box.scrollIntoView({ block: 'nearest' });
+}
+
+$('#btn-link-auth-revert').addEventListener('click', () => {
+  if (!linkConflict) return;
+  const st = linkConflict.stored;
+  form.clientId.value = st.clientId;
+  form.apiKey.value = st.apiKey;
+  for (const radio of $$('input[name="authMode"]', form)) radio.checked = radio.value === st.authMode;
+  state.settings = { ...state.settings, ...st };
+  $('#link-auth-warning').hidden = true;
+  syncModePanels();
+  toast('保存済みの接続設定に戻しました');
+});
 
 function syncModePanels() {
   const mode = ($('input[name="authMode"]:checked', form) || {}).value || 'oauth';
   for (const p of $$('[data-mode]')) p.hidden = p.dataset.mode !== mode;
   if (mode === 'oauth') {
-    ensureSession(form.clientId.value.trim());
+    ensureSession(formAuth().clientId);
     updateLoginStatus();
   }
 }
@@ -127,7 +189,8 @@ function setupError(msg) {
 
 function fillTimeZones() {
   const list = $('#tz-list');
-  let zones = ['Europe/Helsinki', 'Asia/Tokyo', 'Europe/Stockholm', 'Europe/Oslo', 'Europe/Tallinn', 'Europe/London', 'Europe/Paris', 'UTC'];
+  // 先頭はこの端末のタイムゾーン（既定値）と、よく使うもの
+  let zones = [DEFAULTS.timeZone, 'Asia/Tokyo', 'Europe/London', 'Europe/Paris', 'America/New_York', 'America/Los_Angeles', 'UTC'];
   try {
     if (Intl.supportedValuesOf) zones = [...new Set([...zones, ...Intl.supportedValuesOf('timeZone')])];
   } catch {
@@ -188,7 +251,7 @@ function onSessionChange(e) {
 function updateLoginStatus(errorMsg) {
   const el = $('#login-status');
   const session = state.session;
-  if (!form.clientId.value.trim()) {
+  if (!formAuth().clientId) {
     el.replaceChildren(h('span', { class: 'muted' }, ['OAuth クライアント ID を入力してください。']));
     return;
   }
@@ -196,23 +259,37 @@ function updateLoginStatus(errorMsg) {
     el.replaceChildren(h('span', { class: 'error-text' }, [errorMsg]));
     return;
   }
+  const loginBtn = () =>
+    h('button', { type: 'button', class: 'btn btn-secondary btn-sm', onclick: () => signIn().catch((e) => updateLoginStatus(e.message)) }, ['ログイン']);
+  const logoutBtn = () => h('button', { type: 'button', class: 'btn btn-ghost btn-sm', onclick: () => signOut(session) }, ['ログアウト']);
   if (session && session.signedIn) {
     const mins = Math.max(0, Math.round((session.expiresAt - Date.now()) / 60000));
-    el.replaceChildren(
-      h('span', { class: 'ok-text' }, [`ログイン中（あと約 ${mins} 分有効）`]),
-      h('button', { type: 'button', class: 'btn btn-ghost btn-sm', onclick: () => session.signOut() }, ['ログアウト']),
-    );
+    el.replaceChildren(h('span', { class: 'ok-text' }, [`ログイン中（あと約 ${mins} 分有効）`]), logoutBtn());
+  } else if (session && session.hasToken) {
+    // 期限切れのトークンが残っている: ログインし直すか、ログアウトして消せる
+    el.replaceChildren(h('span', { class: 'muted' }, ['ログインの有効期限が切れました。']), loginBtn(), logoutBtn());
   } else {
-    el.replaceChildren(
-      h('span', { class: 'muted' }, ['「スライドショーを開始」を押すと Google のログイン画面が開きます。']),
-      h('button', { type: 'button', class: 'btn btn-secondary btn-sm', onclick: () => signIn().catch((e) => updateLoginStatus(e.message)) }, ['ログイン']),
-    );
+    // トークンはないが、以前の撮影日時の解析結果が残っている（API に拒否された、タブを開き直したなど）: ログアウトで消せる
+    const extra = hasMetaCache() ? [logoutBtn()] : [];
+    el.replaceChildren(h('span', { class: 'muted' }, ['「スライドショーを開始」を押すと Google のログイン画面が開きます。']), loginBtn(), ...extra);
   }
+}
+
+/**
+ * ログアウト: トークンを取り消して消し、このブラウザに残した撮影日時の解析結果と読み込んだ写真も消す
+ * （保存した設定（フォルダ・時刻補正など）は残す）。トークンがなくても（期限切れ・拒否のあと）解析結果は消す
+ */
+function signOut(session) {
+  clearMetaCache();
+  state.loader?.clear();
+  session?.signOut();
+  updateLoginStatus();
+  toast('ログアウトしました');
 }
 
 /** ログインする（ユーザー操作の中で呼ぶこと） */
 async function signIn() {
-  const session = ensureSession(form.clientId.value.trim() || state.settings.clientId);
+  const session = ensureSession(formAuth().clientId || state.settings.clientId);
   if (!session) throw new AuthError('OAuth クライアント ID を入力してください。', 'config');
   if (!session.client) await session.init();
   const token = await session.request({ prompt: '' });
@@ -379,7 +456,7 @@ function setLoading(title, detail = '', frac = null) {
 }
 
 function timeZoneError(tz) {
-  return isValidTimeZone(tz) ? null : `タイムゾーン「${tz}」が正しくありません（例：Europe/Helsinki）。`;
+  return isValidTimeZone(tz) ? null : `タイムゾーン「${tz}」が正しくありません（例：Europe/Paris、America/New_York）。`;
 }
 
 function validate(s) {
@@ -402,7 +479,9 @@ form.addEventListener('submit', async (e) => {
   }
   const s = sanitize(raw);
   state.settings = s;
+  // 画面に出ている値を保存する（リンクの接続設定の警告が出ていれば、利用者はそれを見て開始している）
   saveSettings(s);
+  $('#link-auth-warning').hidden = true;
   if (s.authMode === 'oauth') {
     const session = ensureSession(s.clientId);
     if (!session.isValidFor(MIN_TOKEN_MS)) {
@@ -438,7 +517,7 @@ $('#btn-share').addEventListener('click', async () => {
     setupError(err);
     return;
   }
-  const url = buildShareUrl(location.href, sanitize(raw));
+  const url = buildShareUrl(location.href, sanitize(raw), lock);
   try {
     await navigator.clipboard.writeText(url);
     toast('共有用リンクをコピーしました');
@@ -618,7 +697,12 @@ function startPlayer() {
       onOpenGrid: () => openGrid(),
       onOpenSettings: () => backToSetup(),
     });
-    state.player.addEventListener('settingschange', () => saveSettings(state.settings));
+    // 変えた項目だけを保存する（リンクで渡されただけのフォルダ・タイトル・API キーなどは保存しない）
+    state.player.addEventListener('settingschange', (e) => {
+      const patch = {};
+      for (const k of PLAYER_SETTINGS) if (e.detail && k in e.detail) patch[k] = e.detail[k];
+      if (Object.keys(patch).length) storeOnly(patch);
+    });
   } else {
     state.player.loader = state.loader;
   }
@@ -991,7 +1075,9 @@ $('#btn-time-fix-apply').addEventListener('click', () => {
     else delete offsets[row.dataset.group];
   }
   state.settings = sanitize(withFolderOffsets(state.settings, folderId, offsets));
-  saveSettings(state.settings);
+  // このフォルダの補正だけを保存する（リンクで渡されただけのフォルダ・タイトル・API キーなどは保存しない）
+  const applied = state.settings;
+  storeOnly((stored) => withFolderOffsetsFrom(stored, applied, folderId));
   rebuildCatalog();
   state.player?.setItems(state.items);
   renderGrid();
@@ -1078,6 +1164,7 @@ $('#folder-overlay').addEventListener('keydown', (e) => {
 
 function init() {
   fillTimeZones();
+  applyLockToForm();
   fillForm(state.settings);
   showScreen('setup');
   // URL の tz= が正しくなければ（既定値に戻さず）入力欄に残して知らせる。自動開始もしない
@@ -1086,8 +1173,10 @@ function init() {
   if (tzErr) {
     form.timeZone.value = urlTz;
     setupError(tzErr);
-    return;
   }
+  // リンクの接続設定が保存済みの値と違う: 警告を出して確かめてもらう（自動開始もしない）
+  if (linkConflict) showLinkAuthWarning();
+  if (tzErr || linkConflict) return;
   // ?autostart=1 で設定が揃っていればすぐに開始（API キー、またはログイン済みの場合）
   if (params.get('autostart') === '1' && !validate(state.settings)) {
     if (state.settings.authMode === 'apikey' || ensureSession(state.settings.clientId)?.signedIn) {

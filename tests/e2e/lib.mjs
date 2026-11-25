@@ -17,8 +17,19 @@ export { expectedOrder, filesById, TEST_KEY, TEST_TOKEN, assert };
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 export const OUT_DIR = path.join(HERE, 'out');
-export const SETTINGS_KEY = 'finland-slideshow.settings.v1';
-export const META_CACHE_KEY = 'finland-slideshow.meta.v1';
+export const SETTINGS_KEY = 'photo-slideshow.settings.v1';
+export const META_CACHE_KEY = 'photo-slideshow.meta.v1';
+export const TOKEN_KEY = 'photo-slideshow.token.v1';
+/** Trip time zone of the fixtures (manifest.tripTimeZone); seeded as the `timeZone` setting (FAST_SETTINGS). */
+export const TRIP_TZ = 'Europe/Athens';
+/**
+ * Time zone of every browser context (the "device"), unless a test passes another `timezoneId`. Deliberately far
+ * from TRIP_TZ (10 h in July, different calendar days for most fixtures), so code that formats or groups times in
+ * the device's zone instead of the trip zone setting gives other captions / day cards and fails. The app's default
+ * trip zone is the device's zone: tests of that default either compare with the page's own zone or pass
+ * `contextOptions: { timezoneId }`.
+ */
+export const DEVICE_TZ = 'America/Los_Angeles';
 
 /** Settings seeded into localStorage (only if nothing is stored yet) so every test runs fast. */
 export const FAST_SETTINGS = Object.freeze({
@@ -28,6 +39,7 @@ export const FAST_SETTINGS = Object.freeze({
   kenBurns: true,
   blurBackground: true,
   refreshMinutes: 0,
+  timeZone: TRIP_TZ,
 });
 
 /** Minimal stand-in for Google Identity Services (token model). */
@@ -57,19 +69,25 @@ export const GIS_STUB = `
       };
     },
     hasGrantedAllScopes() { return true; },
-    revoke(t, cb) { cb && cb({ successful: true }); },
+    revoke(t, cb) { (window.__gis.revoked = window.__gis.revoked || []).push(t); cb && cb({ successful: true }); },
   };
 })();`;
 
 /**
  * Init script installed in every page: records which slides became visible (in order),
- * toasts, video progress, and samples the corner colour of each displayed photo.
+ * toasts, video progress, Content-Security-Policy violations (window.__csp), and samples the corner
+ * colour of each displayed photo.
  */
 const RECORDER = `
 (() => {
   window.__slideLog = [];
   window.__toasts = [];
   window.__video = {};
+  window.__csp = [];
+  document.addEventListener('securitypolicyviolation', (e) => {
+    window.__csp.push({ directive: e.effectiveDirective || e.violatedDirective, blocked: e.blockedURI,
+      source: e.sourceFile, line: e.lineNumber, sample: e.sample });
+  });
   const seen = new WeakSet();
   function sample(el, entry) {
     const img = el.querySelector('img.photo');
@@ -169,6 +187,10 @@ export function safeName(s) {
 export async function openSuite({ maxPageSize, driveOptions } = {}) {
   fs.mkdirSync(OUT_DIR, { recursive: true });
   const env = await startServers({ appPort: 0, drivePort: 0, maxPageSize, driveOptions });
+  if (env.manifest.tripTimeZone !== TRIP_TZ) {
+    await env.close();
+    throw new Error(`fixtures use the trip time zone ${env.manifest.tripTimeZone}, expected ${TRIP_TZ} (re-run tests/fixtures/generate.py)`);
+  }
   const { chromium } = loadPlaywright();
   let browser;
   try {
@@ -185,11 +207,11 @@ export async function openSuite({ maxPageSize, driveOptions } = {}) {
    * @param {object} [o]
    * @param {object} [o.params]      app URL parameters (apiBase is added automatically)
    * @param {object|null} [o.settings] localStorage settings seeded before the first load (merged over FAST_SETTINGS)
-   * @param {object} [o.contextOptions] extra browser.newContext() options
+   * @param {object} [o.contextOptions] extra browser.newContext() options (default time zone: DEVICE_TZ)
    * @param {boolean} [o.navigate=true]
    */
   async function newApp({ params = {}, settings = {}, contextOptions = {}, navigate = true } = {}) {
-    const context = await browser.newContext({ viewport: { width: 1280, height: 720 }, ...contextOptions });
+    const context = await browser.newContext({ viewport: { width: 1280, height: 720 }, timezoneId: DEVICE_TZ, ...contextOptions });
     const errors = [];
     const consoleMsgs = [];
     const previewRequests = [];
@@ -265,12 +287,17 @@ export async function openSuite({ maxPageSize, driveOptions } = {}) {
           return true;
         }, { id, kind, day }, { timeout });
       },
-      /** wait until the slide log contains an entry matching pred (serialisable function source) */
-      async waitForLog(predSrc, timeout = 30000) {
-        await page.waitForFunction((src) => {
-          const pred = new Function('e', `return (${src})(e);`);
-          return window.__slideLog.some((e) => pred(e));
-        }, predSrc, { timeout });
+      /**
+       * wait until pred(window.__slideLog) is true. pred runs in the page and must be a function, not source
+       * text: the app's CSP forbids eval / new Function in the page (and so does Playwright's string form).
+       */
+      async waitForLog(pred, timeout = 30000) {
+        const log = await page.evaluateHandle(() => window.__slideLog);
+        try {
+          await page.waitForFunction(pred, log, { timeout });
+        } finally {
+          await log.dispose().catch(() => {});
+        }
       },
       /** OAuth flow: open the setup page in OAuth mode and press 「スライドショーを開始」 (GIS is stubbed) */
       async startOAuth(folder, extra = {}) {
@@ -358,6 +385,22 @@ export function assertNoPageErrors(app) {
   assert.deepEqual(app.errors, [], `uncaught page errors:\n${app.errors.join('\n')}`);
 }
 
+/**
+ * Content-Security-Policy violations seen by the page: `securitypolicyviolation` events of the current document
+ * plus every console message about the CSP since the context was opened (also before a reload).
+ */
+export async function cspViolations(app) {
+  const inPage = await app.page.evaluate(() => (window.__csp || []).map((v) => ({ ...v }))).catch(() => []);
+  const fromConsole = app.consoleMsgs.filter((m) => /Content Security Policy/i.test(m.text)).map((m) => ({ console: m.text }));
+  return [...inPage, ...fromConsole];
+}
+
+/** Assert the app ran without any Content-Security-Policy violation (index.html's CSP + the mock's origin). */
+export async function assertNoCspViolations(app) {
+  const v = await cspViolations(app);
+  assert.deepEqual(v, [], `Content-Security-Policy violations:\n${JSON.stringify(v, null, 1)}`);
+}
+
 /** Pretty diff of two id arrays for assertion messages. */
 export function orderDiff(actual, expected) {
   const lines = [];
@@ -430,7 +473,7 @@ export async function startStrippingProxy(targetUrl, { strip = ['access-control-
 }
 
 /** "7月12日（土） 12:05" for an ISO instant in a time zone (the app's caption format) */
-export function jaDateTime(iso, timeZone = 'Europe/Helsinki') {
+export function jaDateTime(iso, timeZone = TRIP_TZ) {
   const parts = Object.fromEntries(new Intl.DateTimeFormat('en-US', {
     timeZone, hourCycle: 'h23', month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit', weekday: 'short',
   }).formatToParts(new Date(iso)).map((p) => [p.type, p.value]));

@@ -1,7 +1,7 @@
 // Scenario 7 (error handling), scenario 8 (resource keys) and scenario 15 (share link).
 import { test, before, after } from 'node:test';
 import {
-  openSuite, assert, assertOrder, mediaRequests, listRequests, assertNoPageErrors, colorNear, TEST_KEY,
+  openSuite, assert, assertOrder, mediaRequests, listRequests, assertNoPageErrors, colorNear, TEST_KEY, DEVICE_TZ,
 } from './lib.mjs';
 
 let suite;
@@ -44,7 +44,7 @@ test('7a. start-up errors are shown in Japanese on the setup screen (bad key, pr
   assert.equal(await setupError(app), MSG.notFoundKey, 'unknown id');
 
   // a folder without any media
-  await suite.admin.remove('img_extra_porvoo');
+  await suite.admin.remove('img_extra_old_town');
   await app.goto({ ...ROOT_PARAMS, folder: 'folder_extra' });
   assert.match(await setupError(app), /^フォルダ「Extra \(shared\)」に写真・動画が見つかりませんでした。/);
   await suite.admin.reset();
@@ -91,8 +91,8 @@ test('7b. setup form validation (empty / malformed folder URL, missing key / cli
     await page.fill('#f-folder', url);
     await page.click('#btn-start');
     await app.waitForPlayer();
-    assert.deepEqual(await app.itemIds(), ['img_porvoo', 'img_airport'], url);
-    assert.equal(await page.evaluate(() => window.__slideshow.root.name), 'Day4 Porvoo');
+    assert.deepEqual(await app.itemIds(), ['img_old_town', 'img_airport'], url);
+    assert.equal(await page.evaluate(() => window.__slideshow.root.name), 'Day4 Old town');
     await page.mouse.move(500, 300);
     await page.click('#player .ctl-settings');
     await page.waitForSelector('#setup:not([hidden])');
@@ -116,7 +116,7 @@ test('7b2. an invalid trip time zone typed in the form is rejected with the vali
   await page.waitForFunction(() => window.__slideshow.screen === 'player' || !document.querySelector('#setup-error').hidden, null, { timeout: 20000 });
   const st = await page.evaluate(() => ({ screen: window.__slideshow.screen, tz: window.__slideshow.settings.timeZone, err: document.querySelector('#setup-error').textContent }));
   assert.equal(st.screen, 'setup', `the show started anyway with timeZone=${st.tz} (the form input must be validated before sanitize() replaces it)`);
-  assert.equal(st.err, 'タイムゾーン「Asia/Tokio」が正しくありません（例：Europe/Helsinki）。');
+  assert.equal(st.err, 'タイムゾーン「Asia/Tokio」が正しくありません（例：Europe/Paris、America/New_York）。');
   // the share button does not produce a link without the time zone either
   await page.evaluate(() => {
     window.__copied = [];
@@ -128,7 +128,7 @@ test('7b2. an invalid trip time zone typed in the form is rejected with the vali
   });
   await page.click('#btn-share');
   const share = await page.evaluate(() => ({ copied: window.__copied, err: document.querySelector('#setup-error').hidden ? '' : document.querySelector('#setup-error').textContent }));
-  assert.deepEqual(share, { copied: [], err: 'タイムゾーン「Asia/Tokio」が正しくありません（例：Europe/Helsinki）。' });
+  assert.deepEqual(share, { copied: [], err: 'タイムゾーン「Asia/Tokio」が正しくありません（例：Europe/Paris、America/New_York）。' });
   await page.fill('input[name="timeZone"]', 'Asia/Tokyo');
   await page.click('#btn-share');
   const ok = await page.evaluate(() => window.__copied);
@@ -139,7 +139,7 @@ test('7b2. an invalid trip time zone typed in the form is rejected with the vali
   await page.waitForSelector('#setup:not([hidden])');
   await page.waitForTimeout(1000);
   const fromUrl = await page.evaluate(() => ({ screen: window.__slideshow.screen, tz: document.querySelector('input[name="timeZone"]').value, err: document.querySelector('#setup-error').textContent }));
-  assert.deepEqual(fromUrl, { screen: 'setup', tz: 'Asia/Tokio', err: 'タイムゾーン「Asia/Tokio」が正しくありません（例：Europe/Helsinki）。' });
+  assert.deepEqual(fromUrl, { screen: 'setup', tz: 'Asia/Tokio', err: 'タイムゾーン「Asia/Tokio」が正しくありません（例：Europe/Paris、America/New_York）。' });
   await app.close();
 })(t));
 
@@ -156,13 +156,13 @@ test('7c. a photo that cannot be downloaded (HTTP 500, no thumbnail) is skipped 
   await app.waitForPlayer();
   const ids = await app.itemIds();
   assert.ok(ids.includes('img_breakfast'), 'listed (metadata is fine)');
-  await app.jumpViaGrid('img_santa_canon');
-  // santa → day 3 card → (img_breakfast skipped) → vid_pxl_husky → img_lake
+  await app.jumpViaGrid('img_village_canon');
+  // village → day 3 card → (img_breakfast skipped) → vid_pxl_bike → img_lake
   await app.waitForSlide({ id: 'img_lake' }, 30000);
   const log = await app.slideLog();
-  const from = log.findIndex((e) => e.id === 'img_santa_canon');
+  const from = log.findIndex((e) => e.id === 'img_village_canon');
   const seq = log.slice(from).map((e) => e.id || `${e.kind}:${e.day || ''}`);
-  assert.deepEqual(seq.slice(0, 4), ['img_santa_canon', 'day:2025-07-14', 'vid_pxl_husky', 'img_lake'], `sequence ${seq}`);
+  assert.deepEqual(seq.slice(0, 4), ['img_village_canon', 'day:2025-07-14', 'vid_pxl_bike', 'img_lake'], `sequence ${seq}`);
   assert.ok(!log.some((e) => e.id === 'img_breakfast'), 'broken photo never shown');
   assert.ok(!log.some((e) => e.kind === 'message'), 'no error card');
   const toasts = await app.toasts();
@@ -271,6 +271,10 @@ test('15. share link: 共有用リンクをコピー produces a URL that pre-fil
   await page.fill('#f-apiKey', TEST_KEY);
   await page.click('#display-settings summary');
   await page.fill('input[name="title"]', 'テスト旅行');
+  // the default trip zone is this browser's zone; the link carries it anyway (the recipient's device may be elsewhere)
+  assert.equal(await page.evaluate(() => Intl.DateTimeFormat().resolvedOptions().timeZone), DEVICE_TZ);
+  assert.equal(await page.inputValue('input[name="timeZone"]'), DEVICE_TZ, 'default trip zone = the browser time zone');
+  assert.equal(new URL(await copied()).searchParams.get('tz'), DEVICE_TZ, 'tz is in the link even when it is the default');
   await page.fill('input[name="timeZone"]', 'Asia/Tokyo');
   const shareUrl = await copied();
   assert.ok((await app.toasts()).some((x) => x.text === '共有用リンクをコピーしました') || prompted, 'copied (toast) or shown in a prompt');
@@ -314,6 +318,7 @@ test('15. share link: 共有用リンクをコピー produces a URL that pre-fil
   assert.equal(oauthUrl.searchParams.get('mode'), 'oauth');
   assert.equal(oauthUrl.searchParams.get('clientId'), 'test-client.apps.googleusercontent.com');
   assert.equal(oauthUrl.searchParams.get('key'), null);
+  assert.equal(oauthUrl.searchParams.get('tz'), 'Asia/Tokyo');
   assert.ok(!/token/i.test(oauthUrl.search));
   assertNoPageErrors(app);
   await app.close();

@@ -67,9 +67,9 @@ await check('img: JPEG via ?alt=media&key, EXIF orientation 6 auto-rotated, thum
       i.src = src;
     });
     return { normal: await load(a), rotated: await load(b), thumb: await load(t) };
-  }, { a: media('img_senate_square'), b: media('img_helsinki_cathedral'), t: `${D}/thumb/img_helsinki_cathedral=s220` });
+  }, { a: media('img_city_square'), b: media('img_cathedral'), t: `${D}/thumb/img_cathedral=s220` });
   assert.deepEqual(r.normal, { ok: true, w: 1280, h: 853 });
-  const exp = byId.img_helsinki_cathedral._test.expected;
+  const exp = byId.img_cathedral._test.expected;
   assert.deepEqual(r.rotated, { ok: true, w: exp.displayWidth, h: exp.displayHeight });
   assert.equal(r.thumb.ok, true);
   assert.ok(r.thumb.h > r.thumb.w, 'thumbnail is upright (portrait)');
@@ -78,7 +78,7 @@ await check('img: HEIC is not decodable natively (app must fall back), its thumb
   const r = await page.evaluate(async ({ a, t }) => {
     const load = (src) => new Promise((res) => { const i = new Image(); i.onload = () => res(true); i.onerror = () => res(false); i.src = src; });
     return { heic: await load(a), thumb: await load(t) };
-  }, { a: media('img_arctic_circle_heic'), t: `${D}/thumb/img_arctic_circle_heic=s220` });
+  }, { a: media('img_viewpoint_heic'), t: `${D}/thumb/img_viewpoint_heic=s220` });
   assert.equal(r.thumb, true);
   console.log(`       (native HEIC decode in this Chromium: ${r.heic})`);
 });
@@ -109,14 +109,14 @@ await check('video: H.264 mp4 (moov at end), faststart mp4 and MOV play; HEVC re
     const out = {};
     for (const [k, s] of Object.entries(srcs)) out[k] = await probe(s);
     return out;
-  }, { tram: media('vid_tram'), ferry: media('vid_harbour_ferry'), mov: media('vid_reindeer_mov'), pxl: media('vid_pxl_husky'), hevc: media('vid_hevc') });
+  }, { tram: media('vid_tram'), ferry: media('vid_harbour_ferry'), mov: media('vid_deer_mov'), pxl: media('vid_pxl_bike'), hevc: media('vid_hevc') });
   for (const id of ['tram', 'ferry', 'mov', 'pxl']) {
     assert.equal(r[id].ok, true, `${id}: ${JSON.stringify(r[id])}`);
     assert.equal(r[id].w, 640);
     assert.ok(r[id].t > 0, `${id} did not advance`);
   }
   assert.ok(near(r.tram.px, hexToRgb(byId.vid_tram._test.bgColor), 24), `corner colour ${r.tram.px} vs ${byId.vid_tram._test.bgColor}`);
-  assert.ok(near(r.mov.px, hexToRgb(byId.vid_reindeer_mov._test.bgColor), 24));
+  assert.ok(near(r.mov.px, hexToRgb(byId.vid_deer_mov._test.bgColor), 24));
   // HEVC support depends on the Chromium build / platform decoders: informational only.
   // Playwright's Linux Chromium plays the AAC track but never decodes a frame
   // (videoWidth/videoHeight stay 0 and no 'error' event fires).
@@ -134,8 +134,8 @@ await check('image corner colour identifies the slide', async () => {
     const g = c.getContext('2d');
     g.drawImage(i, 0, 0);
     return Array.from(g.getImageData(10, 10, 1, 1).data.slice(0, 3));
-  }, media('img_santa_canon'));
-  assert.ok(near(r, hexToRgb(byId.img_santa_canon._test.bgColor), 12), `${r}`);
+  }, media('img_village_canon'));
+  assert.ok(near(r, hexToRgb(byId.img_village_canon._test.bgColor), 12), `${r}`);
 });
 await check('routeGoogleApis(): https://www.googleapis.com/drive/** is served by the mock', async () => {
   const p2 = await context.newPage();
