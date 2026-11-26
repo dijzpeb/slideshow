@@ -211,7 +211,7 @@ export class OAuthSession extends EventTarget {
       this._settle(
         false,
         new AuthError(
-          'Google ドライブのファイルを表示する権限が許可されていません。ログイン画面でチェックボックスをオンにしてください。',
+          'Google ドライブのファイルを表示する権限が許可されていません。もう一度ログインして、Google ドライブへのアクセスを許可してください。',
           'scope',
         ),
       );
