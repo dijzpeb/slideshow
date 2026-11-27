@@ -1,0 +1,13 @@
+{
+  "name": "drive-trip-slideshow",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Google ドライブのフォルダの写真・動画を撮影日時順にスライドショー再生する静的ウェブアプリ",
+  "type": "module",
+  "scripts": {
+    "start": "node scripts/serve.mjs --port 8080",
+    "test": "node --test \"tests/unit/**/*.test.mjs\"",
+    "fixtures": "python3 tests/fixtures/generate.py",
+    "test:e2e": "node --test --test-concurrency=1 \"tests/e2e/**/*.test.mjs\""
+  }
+}
