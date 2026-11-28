@@ -10,6 +10,8 @@ const TITLE_SECONDS = 5;
 const VIDEO_READY_WAIT = 8000;
 const VIDEO_STALL_TIMEOUT = 45000;
 const VIDEO_PAUSED_STALL = 3000; // 再生中なのに動画が止まったままの時間（ブラウザに止められた等）
+// 再生中の動画の残りがこの秒数になったら、次の動画を先読みし始める（それまでは再生中の動画に帯域を譲る）
+const VIDEO_PRELOAD_LEAD = 10;
 const HUD_HIDE_MS = 3000;
 /** 別のスライドへ移るキー */
 const NAV_KEYS = new Set(['ArrowRight', 'ArrowLeft', 'PageDown', 'PageUp', 'Home', 'End']);
@@ -24,6 +26,17 @@ export function drivePreviewUrl(item, { autoplay = false } = {}) {
 
 function prefersReducedMotion() {
   return window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+}
+
+/** <video> の読み込みを止めて、バッファーと接続を解放する */
+function releaseVideo(video) {
+  video.pause();
+  video.removeAttribute('src');
+  try {
+    video.load();
+  } catch {
+    /* ignore */
+  }
 }
 
 export class Player extends EventTarget {
@@ -63,6 +76,8 @@ export class Player extends EventTarget {
     // 表示中のスライドが一覧から消えた（更新で削除された）とき true。index は次に表示するスライドを指す
     this.detached = false;
     this.drivePlayer = null; // {el, close}
+    // 次に表示する動画を裏で読み込んでおく <video>（表示するときにそのまま使う）{id, sig, src, video}
+    this.videoPreload = null;
     this._staleFns = new Set(); // seq が変わったときに呼ぶ関数
     this._loadingSeq = 0; // 読み込み中の goTo の seq（読み込みが終わったら 0）
     this._retriedAbort = false;
@@ -200,6 +215,9 @@ export class Player extends EventTarget {
       } else if (wasEmpty) {
         this.goTo(0);
         this._showHud(); // 空のカードで固定していた操作パネルを、また自動で隠す
+      } else {
+        // 並びが変わって、次に表示するものが動画になった / 先読みしていた動画が次ではなくなった
+        this._maybePreloadNextVideo();
       }
     }
   }
@@ -232,6 +250,7 @@ export class Player extends EventTarget {
     this._releaseWakeLock();
     this._setMediaSession(false);
     this._closeDrivePlayer();
+    this._dropVideoPreload();
     clearTimeout(this.hudTimer);
     document.removeEventListener('keydown', this._onKey);
     this.root.removeEventListener('pointermove', this._onActivity);
@@ -383,6 +402,7 @@ export class Player extends EventTarget {
       this._nextSeq();
       this._clearTimer();
       this._setSpinner(false);
+      this._dropVideoPreload();
       this.index = 0;
       this._swap(this._renderMessage('表示できる写真・動画がありません'), { kind: 'end', empty: true });
       this.caption.replaceChildren();
@@ -394,6 +414,8 @@ export class Player extends EventTarget {
     this.index = index;
     const seq = this._nextSeq();
     this._clearTimer();
+    // 先読みした動画は、これから表示するスライドかその次のものなら残す（日付カードを挟むときなど）。それ以外は止める
+    this._dropVideoPreload(this._videoPreloadKeep(index));
     // 出ていく動画は、次のスライドを読み込んでいる間も再生しない（seq が変わったので、その動画のイベントはもう何もしない）
     if (this.current?.video && !this.current.video.paused) this.current.video.pause();
     this._updateCounter();
@@ -538,6 +560,8 @@ export class Player extends EventTarget {
     const s = this.getSettings();
     let src = this.loader.streamUrl(item);
     let blobHandle = null;
+    // 前のスライドの表示中に先読みしておいた動画があれば、読み込んだところから使う
+    let video = src ? this._takePreloadedVideo(item, src) : null;
     if (!src) {
       // ストリーミングできない環境（Service Worker 無効など）では全体をダウンロード
       this._setSpinner(true);
@@ -555,25 +579,11 @@ export class Player extends EventTarget {
         offBlob();
       }
     }
-    const video = h('video', {
-      class: 'video',
-      playsinline: true,
-      'webkit-playsinline': true,
-      preload: 'auto',
-      disablepictureinpicture: true,
-    });
+    if (!video) video = this._createVideo(item);
     video.muted = s.videoMuted || !this.audioUnlocked;
-    const poster = this.loader.thumbnailUrl(item, 1280);
-    if (poster) video.poster = poster;
     const el = h('div', { class: 'slide-video', dataset: { id: item.id, kind: 'video' } }, [video]);
     const cleanup = () => {
-      video.pause();
-      video.removeAttribute('src');
-      try {
-        video.load();
-      } catch {
-        /* ignore */
-      }
+      releaseVideo(video);
       blobHandle?.revoke();
     };
     let ready = false;
@@ -603,7 +613,9 @@ export class Player extends EventTarget {
           },
           { once: true },
         );
-        video.src = src;
+        // 先読みで最初のフレームまで読めていれば待たない（まだなら、先読みの続きの loadeddata を待つ）
+        if (video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA) ok();
+        else if (!video.hasAttribute('src')) video.src = src;
       });
     } catch (e) {
       cleanup();
@@ -645,6 +657,7 @@ export class Player extends EventTarget {
     this._clearTimer();
     this._swap(prepared.el, prepared);
     this._begin(prepared);
+    this._maybePreloadNextVideo(); // 再生しない代わりのスライドなら、次の動画をもう先読みしてよい
   }
 
   async _tokenStillValid() {
@@ -760,6 +773,18 @@ export class Player extends EventTarget {
       finished = true;
       this.next();
     };
+    // 終わりが近づいたら（または最後まで読み込めたら）次の動画を先読みする
+    let preloadedNext = false;
+    const preloadNext = () => {
+      if (preloadedNext || stale()) return;
+      const end = Math.min(Number.isFinite(video.duration) ? video.duration : Infinity, maxSec);
+      if (!Number.isFinite(end)) return;
+      const b = video.buffered;
+      const loaded = b.length > 0 && b.end(b.length - 1) >= end - 0.5;
+      if (!loaded && end - video.currentTime > VIDEO_PRELOAD_LEAD) return;
+      preloadedNext = true;
+      this._preloadNextVideo();
+    };
     const onTime = () => {
       const dur = Math.min(Number.isFinite(video.duration) ? video.duration : Infinity, maxSec);
       if (Number.isFinite(dur) && dur > 0) this._setProgress(video.currentTime / dur);
@@ -768,6 +793,7 @@ export class Player extends EventTarget {
         lastProgressAt = performance.now();
       }
       if (video.currentTime >= maxSec) finish();
+      else preloadNext();
     };
     const onEnded = () => finish();
     // アプリ以外（メディアキー、ヘッドホンのボタンや取り外し、OS など）が動画を止めた・動かしたら、スライドショーも合わせる。
@@ -796,6 +822,7 @@ export class Player extends EventTarget {
     };
     video.addEventListener('loadeddata', onLoaded);
     video.addEventListener('timeupdate', onTime);
+    video.addEventListener('progress', preloadNext);
     video.addEventListener('ended', onEnded);
     video.addEventListener('error', onError);
     video.addEventListener('pause', onPause);
@@ -842,6 +869,7 @@ export class Player extends EventTarget {
     cur.cleanup = () => {
       clearInterval(watchdog);
       video.removeEventListener('timeupdate', onTime);
+      video.removeEventListener('progress', preloadNext);
       video.removeEventListener('ended', onEnded);
       video.removeEventListener('error', onError);
       video.removeEventListener('pause', onPause);
@@ -943,6 +971,7 @@ export class Player extends EventTarget {
     this._nextSeq();
     this._clearTimer();
     this._setSpinner(false);
+    this._dropVideoPreload();
     this.playing = false;
     this._syncPlayButton();
     this._releaseWakeLock();
@@ -996,6 +1025,8 @@ export class Player extends EventTarget {
   }
 
   _preloadAround(index) {
+    // 次の動画は写真より先に読み込み始める（切り替えたときに待たせるのは動画のほうなので）
+    this._maybePreloadNextVideo();
     const keep = this._neighborIds();
     let n = 0;
     for (let i = index + 1; i < this.slides.length && n < 3; i++) {
@@ -1009,6 +1040,96 @@ export class Player extends EventTarget {
       if (first) this.loader.loadImage(first.item, { keep }).catch(() => {});
     }
     this.loader.retain(keep);
+  }
+
+  /** index のスライドの次に表示する写真・動画（繰り返し再生なら先頭に戻って探す）。なければ null */
+  _nextMediaItem(index) {
+    const n = this.slides.length;
+    for (let i = index + 1; i < n; i++) if (this.slides[i].type === 'media') return this.slides[i].item;
+    if (!this.getSettings().loop) return null;
+    for (let i = 0; i <= Math.min(index, n - 1); i++) if (this.slides[i].type === 'media') return this.slides[i].item;
+    return null;
+  }
+
+  /** スライドの <video> を作る（src はまだ設定しない） */
+  _createVideo(item) {
+    const video = h('video', {
+      class: 'video',
+      playsinline: true,
+      'webkit-playsinline': true,
+      preload: 'auto',
+      disablepictureinpicture: true,
+    });
+    const poster = this.loader.thumbnailUrl(item, 1280);
+    if (poster) video.poster = poster;
+    return video;
+  }
+
+  _isPreloadOf(p, item, src = null) {
+    return !!p && !!item && p.id === item.id && p.sig === item.modifiedTime && (src == null || p.src === src);
+  }
+
+  /**
+   * 次に表示する写真・動画が動画なら、裏で読み込み始めておく（スライドを切り替えたときにすぐ再生できるように）。
+   * 先読みするのは 1 本だけ。ストリーミングできない環境（全体のダウンロードが必要）と、通信量を節約する設定では先読みしない
+   */
+  _preloadNextVideo() {
+    if (!this.active) return;
+    const item = this._nextMediaItem(this.detached ? this.index - 1 : this.index);
+    const src = item && item.kind === 'video' && !navigator.connection?.saveData ? this.loader.streamUrl(item) : null;
+    if (src && this._isPreloadOf(this.videoPreload, item, src)) return;
+    this._dropVideoPreload();
+    if (!src) return;
+    const video = this._createVideo(item);
+    video.muted = true; // 表示するときに設定に合わせる
+    video.src = src;
+    this.videoPreload = { id: item.id, sig: item.modifiedTime, src, video };
+  }
+
+  /**
+   * 表示中（または読み込み中）のスライドが再生する動画でなければ、次の動画を先読みする。
+   * 動画の再生中は、その動画と帯域を取り合わないように、終わりが近づいてから先読みする（_startVideo）
+   */
+  _maybePreloadNextVideo() {
+    if (!this.active || this.current?.kind === 'end') return;
+    const s = this.detached ? null : this.slides[this.index];
+    if (s && s.type === 'media' && s.item.kind === 'video') {
+      // 再生できずに代わりのスライド（「ドライブのプレーヤーで再生」ボタン）を表示しているときだけ先読みする
+      const cur = this.current;
+      const failed = !!cur && cur.seq === this.seq && cur.item?.id === s.item.id && cur.videoFailed;
+      if (!failed) return;
+    }
+    this._preloadNextVideo();
+  }
+
+  /**
+   * 先読みしておいた item の動画を取り出す。なければ null。
+   * 古い版（ファイルが更新された）や、読み込みに失敗した（ログインの期限切れなど）先読みは捨てて null（読み直して、
+   * 失敗ならいつもどおり代わりのスライドにする）
+   */
+  _takePreloadedVideo(item, src) {
+    const p = this.videoPreload;
+    if (!p || p.id !== item.id) return null;
+    this.videoPreload = null;
+    if (!this._isPreloadOf(p, item, src) || p.video.error) {
+      releaseVideo(p.video);
+      return null;
+    }
+    return p.video;
+  }
+
+  /** 先読みしている動画をやめる。keep（写真・動画の配列）のどれかのものなら残す */
+  _dropVideoPreload(keep = []) {
+    const p = this.videoPreload;
+    if (!p || keep.some((item) => this._isPreloadOf(p, item))) return;
+    this.videoPreload = null;
+    releaseVideo(p.video);
+  }
+
+  /** goTo(index) で残す先読み: index のスライドの写真・動画と、その次の写真・動画 */
+  _videoPreloadKeep(index) {
+    const s = this.slides[index];
+    return [s && s.type === 'media' ? s.item : null, this._nextMediaItem(index)].filter(Boolean);
   }
 
   // -------------------------------------------------------------------------
